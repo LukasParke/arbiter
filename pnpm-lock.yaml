@@ -31,7 +31,7 @@ importers:
         version: 5.1.0
       hono:
         specifier: ^4.9.1
-        version: 4.9.1
+        version: 4.10.3
       http-proxy:
         specifier: ^1.18.1
         version: 1.18.1(debug@4.4.1)
@@ -56,7 +56,7 @@ importers:
         version: 9.33.0
       '@hono/node-server':
         specifier: ^1.18.2
-        version: 1.18.2(hono@4.9.1)
+        version: 1.18.2(hono@4.10.3)
       '@types/better-sqlite3':
         specifier: ^7.6.13
         version: 7.6.13
@@ -1740,8 +1740,8 @@ packages:
   highlightjs-vue@1.0.0:
     resolution: {integrity: sha512-PDEfEF102G23vHmPhLyPboFCD+BkMGu+GuJe2d9/eH4FsCwvgBpnc9n0pGE+ffKdph38s6foEZiEjdgHdzp+IA==}
 
-  hono@4.9.1:
-    resolution: {integrity: sha512-qfvdJ42t6CQE0N/iSCa8KsW8SQqYD67YB+TYbwPHlnALvX+s7ynh8otR1NEk5jXtUg73gpV/B82OSufDmwtX3w==}
+  hono@4.10.3:
+    resolution: {integrity: sha512-2LOYWUbnhdxdL8MNbNg9XZig6k+cZXm5IjHn2Aviv7honhBMOHb+jxrKIeJRZJRmn+htUCKhaicxwXuUDlchRA==}
     engines: {node: '>=16.9.0'}
 
   hookable@5.5.3:
@@ -3198,9 +3198,9 @@ snapshots:
       '@tanstack/vue-virtual': 3.13.12(vue@3.5.18(typescript@5.9.2))
       vue: 3.5.18(typescript@5.9.2)
 
-  '@hono/node-server@1.18.2(hono@4.9.1)':
+  '@hono/node-server@1.18.2(hono@4.10.3)':
     dependencies:
-      hono: 4.9.1
+      hono: 4.10.3
 
   '@humanfs/core@0.19.1': {}
 
@@ -4917,7 +4917,7 @@ snapshots:
 
   highlightjs-vue@1.0.0: {}
 
-  hono@4.9.1: {}
+  hono@4.10.3: {}
 
   hookable@5.5.3: {}
 
