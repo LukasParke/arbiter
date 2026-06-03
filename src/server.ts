@@ -8,6 +8,7 @@ import { initStorage, storage } from './storage/index.js';
 import chalk from 'chalk';
 import { IncomingMessage, ServerResponse } from 'http';
 import type { SecurityInfo } from './store/openApiStore.js';
+import { diffAgainstSpec } from './diff.js';
 import bodyParser from 'body-parser';
 
 // Create a simple HAR store
@@ -131,6 +132,7 @@ export interface ServerOptions {
   docsPort: number;
   verbose?: boolean;
   dbPath?: string;
+  diffAgainst?: string;
 }
 
 /**
@@ -142,6 +144,7 @@ export async function startServers({
   docsPort,
   verbose = false,
   dbPath,
+  diffAgainst,
 }: ServerOptions): Promise<{
   proxyServer: ReturnType<typeof createServer>;
   docsServer: ReturnType<typeof createServer>;
@@ -504,6 +507,38 @@ export async function startServers({
     res.send(JSON.stringify(harStore.getHAR()));
   });
 
+  docsApp.get('/traffic.jsonl', async (req, res) => {
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    const har = harStore.getHAR();
+    for (const entry of har.log.entries) {
+      const url = new URL(entry.request.url);
+      const queryParams: Record<string, string> = {};
+      for (const q of entry.request.queryString) {
+        queryParams[q.name] = q.value;
+      }
+      const reqHeaders: Record<string, string> = {};
+      for (const h of entry.request.headers) {
+        reqHeaders[h.name] = h.value;
+      }
+      const resHeaders: Record<string, string> = {};
+      for (const h of entry.response.headers) {
+        resHeaders[h.name] = h.value;
+      }
+      const line = JSON.stringify({
+        timestamp: entry.startedDateTime,
+        method: entry.request.method,
+        path: url.pathname + url.search,
+        request_headers: reqHeaders,
+        request_body: entry.request.postData?.text || null,
+        response_status: entry.response.status,
+        response_headers: resHeaders,
+        response_body: entry.response.content.text || null,
+      });
+      res.write(line + '\n');
+    }
+    res.end();
+  });
+
   docsApp.get('/openapi.json', async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (dbPath) {
@@ -570,6 +605,19 @@ export async function startServers({
     `);
   });
 
+  // Diff endpoint
+  if (diffAgainst) {
+    docsApp.get('/diff', (req, res) => {
+      try {
+        const result = diffAgainstSpec(diffAgainst);
+        res.setHeader('Content-Type', 'application/json');
+        res.send(JSON.stringify(result, null, 2));
+      } catch (e: any) {
+        res.status(500).json({ error: 'Diff failed', message: e.message });
+      }
+    });
+  }
+
   // Home page with links
   docsApp.get('/', (req, res) => {
     res.setHeader('Content-Type', 'text/html');
@@ -594,6 +642,8 @@ export async function startServers({
             <li><a href="/openapi.json">OpenAPI JSON</a></li>
             <li><a href="/openapi.yaml">OpenAPI YAML</a></li>
             <li><a href="/har">HAR Export</a></li>
+            <li><a href="/traffic.jsonl">Traffic JSONL</a></li>
+            ${diffAgainst ? '<li><a href="/diff">Diff Report</a></li>' : ''}
           </ul>
         </body>
       </html>
@@ -643,6 +693,77 @@ export async function startServers({
   const proxyServer = createServer(proxyApp);
   const docsServer = createServer(docsApp);
 
+  // WebSocket frame recording
+  const wsFrames: Array<{
+    timestamp: string;
+    path: string;
+    direction: 'sent' | 'received';
+    data: string;
+  }> = [];
+
+  proxyServer.on('upgrade', (request, socket, head) => {
+    const path = request.url || '/';
+    if (verbose) {
+      console.log(`WebSocket upgrade: ${path}`);
+    }
+    wsFrames.push({
+      timestamp: new Date().toISOString(),
+      path,
+      direction: 'sent',
+      data: `[upgrade] ${JSON.stringify(request.headers)}`,
+    });
+
+    // Intercept socket data for frame recording
+    const originalWrite = socket.write.bind(socket);
+    socket.write = (data: any, encoding?: any, cb?: any) => {
+      try {
+        const text =
+          typeof data === 'string'
+            ? data
+            : Buffer.isBuffer(data)
+              ? data.toString('utf-8')
+              : String(data);
+        wsFrames.push({
+          timestamp: new Date().toISOString(),
+          path,
+          direction: 'sent',
+          data: text.length > 10000 ? text.substring(0, 10000) + '...' : text,
+        });
+      } catch {}
+      return originalWrite(data, encoding, cb);
+    };
+
+    const originalOnData = socket.on.bind(socket);
+    socket.on = (event: any, listener: any) => {
+      if (event === 'data') {
+        const wrappedListener = (data: any) => {
+          try {
+            const text =
+              typeof data === 'string'
+                ? data
+                : Buffer.isBuffer(data)
+                  ? data.toString('utf-8')
+                  : String(data);
+            wsFrames.push({
+              timestamp: new Date().toISOString(),
+              path,
+              direction: 'received',
+              data: text.length > 10000 ? text.substring(0, 10000) + '...' : text,
+            });
+          } catch {}
+          listener(data);
+        };
+        return originalOnData(event, wrappedListener);
+      }
+      return originalOnData(event, listener);
+    };
+  });
+
+  docsApp.get('/ws', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.send(JSON.stringify({ frames: wsFrames }));
+  });
+
   // Start servers
   return new Promise((resolve, reject) => {
     try {
@@ -672,19 +793,4 @@ export async function startServers({
     }
   });
 
-  // Handle graceful shutdown
-  const shutdown = (signal: string): void => {
-    console.info(`Received ${signal}, shutting down...`);
-    proxyServer.close();
-    docsServer.close();
-    process.exit(0);
-  };
-
-  process.on('SIGTERM', () => {
-    shutdown('SIGTERM');
-  });
-
-  process.on('SIGINT', () => {
-    shutdown('SIGINT');
-  });
 }

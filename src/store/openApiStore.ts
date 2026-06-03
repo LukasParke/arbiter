@@ -457,7 +457,12 @@ export class OpenAPIStore {
     response: ResponseInfo
   ): void {
     // Convert path parameters to OpenAPI format
-    const openApiPath = path.replace(/\/(\d+)/g, '/{id}').replace(/:(\w+)/g, '{$1}');
+    // Handles: numeric IDs, UUIDs, Plex GUIDs, and long string keys
+    const openApiPath = path
+      .replace(/\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g, '/{guid}')
+      .replace(/\/([0-9a-zA-Z_-]{30,})/g, '/{key}')
+      .replace(/\/(\d+)/g, '/{id}')
+      .replace(/:(\w+)/g, '{$1}');
     const key = `${method}:${openApiPath}`;
     const endpoint: EndpointInfo = this.endpoints.get(key) || {
       path: openApiPath,
