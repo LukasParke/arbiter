@@ -7,6 +7,7 @@ import { discoverCommand } from './commands/discover.js';
 import { validateSchemasCommand } from './commands/validate-schemas.js';
 import { authCommand } from './commands/auth.js';
 import { inferSchemasCommand } from './commands/infer-schemas.js';
+import { replayCommand } from './commands/replay.js';
 
 const program = new Command();
 
@@ -23,5 +24,6 @@ program.addCommand(discoverCommand);
 program.addCommand(validateSchemasCommand);
 program.addCommand(authCommand);
 program.addCommand(inferSchemasCommand);
+program.addCommand(replayCommand);
 
 program.parse(process.argv);
