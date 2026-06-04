@@ -9,6 +9,7 @@ import chalk from 'chalk';
 import { IncomingMessage, ServerResponse } from 'http';
 import type { SecurityInfo } from './store/openApiStore.js';
 import { diffAgainstSpec } from './diff.js';
+import { SpecValidator } from './validate.js';
 import bodyParser from 'body-parser';
 
 // Create a simple HAR store
@@ -133,6 +134,7 @@ export interface ServerOptions {
   verbose?: boolean;
   dbPath?: string;
   diffAgainst?: string;
+  specValidator?: SpecValidator;
 }
 
 /**
@@ -145,6 +147,7 @@ export async function startServers({
   verbose = false,
   dbPath,
   diffAgainst,
+  specValidator,
 }: ServerOptions): Promise<{
   proxyServer: ReturnType<typeof createServer>;
   docsServer: ReturnType<typeof createServer>;
@@ -349,6 +352,45 @@ export async function startServers({
                 } else {
                   // Fallback to req.body
                   requestBody = req.body;
+                }
+              }
+
+              // Validate request/response against spec if validator is configured
+              if (specValidator) {
+                const reqResult = specValidator.validateRequest(
+                  path,
+                  method,
+                  queryParams,
+                  requestHeaders
+                );
+                for (const v of reqResult.violations) {
+                  console.warn(
+                    chalk.yellow('[VALIDATE]'),
+                    `${v.method} ${v.path}: ${v.message}`
+                  );
+                }
+
+                let responseBody: unknown = undefined;
+                if (contentType.includes('json')) {
+                  try {
+                    responseBody = JSON.parse(buffer.toString('utf-8'));
+                  } catch {
+                    // Not valid JSON, skip body validation
+                  }
+                }
+
+                const respResult = specValidator.validateResponse(
+                  path,
+                  method,
+                  proxyRes.statusCode || 200,
+                  contentType,
+                  responseBody
+                );
+                for (const v of respResult.violations) {
+                  console.warn(
+                    chalk.yellow('[VALIDATE]'),
+                    `${v.method} ${v.path}: ${v.message}`
+                  );
                 }
               }
 

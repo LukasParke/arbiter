@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { startServers } from '../server.js';
 import { diffAgainstSpec } from '../diff.js';
+import { SpecValidator } from '../validate.js';
 
 export const startCommand = new Command('start')
   .description('Start the proxy and documentation servers')
@@ -13,6 +14,8 @@ export const startCommand = new Command('start')
   .option('--proxy-only', 'run only the proxy server')
   .option('--diff-against <path>', 'path to an existing OpenAPI spec to diff against')
   .option('--exit-on-gap', 'exit with code 2 if captured endpoints are missing from the spec')
+  .option('--validate', 'validate requests and responses against an OpenAPI spec in real-time')
+  .option('-s, --spec <path>', 'path to OpenAPI spec for real-time validation (requires --validate)')
   .option('-v, --verbose', 'enable verbose logging')
   .action(
     async (options: {
@@ -23,8 +26,26 @@ export const startCommand = new Command('start')
       dbPath?: string;
       diffAgainst?: string;
       exitOnGap?: boolean;
+      validate?: boolean;
+      spec?: string;
     }) => {
       console.info('Starting Arbiter...');
+
+      let specValidator: SpecValidator | undefined;
+      if (options.validate) {
+        if (!options.spec) {
+          console.error(chalk.red('Error: --validate requires --spec <path>'));
+          process.exit(1);
+        }
+        try {
+          specValidator = new SpecValidator(options.spec);
+          console.info(chalk.green('Real-time validation enabled using'), options.spec);
+        } catch (e) {
+          console.error(chalk.red('Failed to load spec for validation:'), e);
+          process.exit(1);
+        }
+      }
+
       const { proxyServer, docsServer } = await startServers({
         target: options.target,
         proxyPort: parseInt(options.port, 10),
@@ -32,6 +53,7 @@ export const startCommand = new Command('start')
         verbose: options.verbose,
         dbPath: options.dbPath,
         diffAgainst: options.diffAgainst,
+        specValidator,
       });
 
       // Handle graceful shutdown with diff check
