@@ -148,3 +148,110 @@ export function diffAgainstSpec(specPath: string): DiffResult {
     queryParamGaps: paramGaps.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
   };
 }
+
+export function writeDiffReport(result: DiffResult, outputPath: string): void {
+  fs.writeFileSync(outputPath, JSON.stringify(result, null, 2));
+}
+
+export function diffFromTraffic(specPath: string, trafficPath: string): DiffResult {
+  const raw = fs.readFileSync(specPath, 'utf-8');
+  let existingSpec: OpenAPIV3_1.Document;
+  if (specPath.endsWith('.yaml') || specPath.endsWith('.yml')) {
+    existingSpec = parseYAML(raw) as OpenAPIV3_1.Document;
+  } else {
+    existingSpec = JSON.parse(raw);
+  }
+  const specPaths = extractSpecPaths(existingSpec);
+
+  const captured = new Set<string>();
+  const queryParams = new Map<string, Set<string>>();
+
+  const trafficRaw = fs.readFileSync(trafficPath, 'utf-8');
+  const lines = trafficRaw.split('\n').filter((line) => line.trim());
+
+  for (const line of lines) {
+    const entry = JSON.parse(line) as { path: string; method: string; queryParams?: string[] };
+    const url = new URL(entry.path, 'http://localhost');
+    const norm = normalizePath(url.pathname);
+    const method = entry.method.toUpperCase();
+    const key = `${norm}|${method}`;
+    captured.add(key);
+
+    const seen = queryParams.get(key) || new Set<string>();
+    if (entry.queryParams) {
+      for (const qp of entry.queryParams) {
+        seen.add(qp);
+      }
+    } else {
+      url.searchParams.forEach((_value, name) => {
+        seen.add(name);
+      });
+    }
+    queryParams.set(key, seen);
+  }
+
+  const missing = new Set<string>();
+  const untested = new Set<string>();
+
+  for (const cap of captured) {
+    if (!specPaths.has(cap)) {
+      missing.add(cap);
+    }
+  }
+
+  for (const spec of specPaths) {
+    if (!captured.has(spec)) {
+      untested.add(spec);
+    }
+  }
+
+  const missingEndpoints = Array.from(missing).map((key) => {
+    const [path, method] = key.split('|');
+    return {
+      path,
+      method,
+      queryParamsSeen: Array.from(queryParams.get(key) || []).sort(),
+    };
+  });
+
+  const untestedEndpoints = Array.from(untested).map((key) => {
+    const [path, method] = key.split('|');
+    return { path, method };
+  });
+
+  const paramGaps: Array<{ path: string; method: string; missingQueryParams: string[] }> = [];
+  for (const key of specPaths) {
+    if (!captured.has(key)) continue;
+    const [path, method] = key.split('|');
+
+    const existingOp = Object.entries(existingSpec.paths || {}).find(([p]) => normalizePath(p) === path)?.[1] as OpenAPIV3_1.OperationObject | undefined;
+    if (!existingOp) continue;
+
+    const specParams = new Set<string>();
+    for (const param of existingOp.parameters || []) {
+      const p = param as OpenAPIV3_1.ParameterObject;
+      if (p.in === 'query' && p.name) {
+        specParams.add(p.name);
+      }
+    }
+
+    const seen = queryParams.get(key) || new Set<string>();
+    const missingParams = Array.from(seen).filter((p) => !specParams.has(p));
+    if (missingParams.length > 0) {
+      paramGaps.push({ path, method, missingQueryParams: missingParams.sort() });
+    }
+  }
+
+  return {
+    summary: {
+      endpointsInSpec: specPaths.size,
+      endpointsCaptured: captured.size,
+      missingFromSpec: missingEndpoints.length,
+      untestedInSpec: untestedEndpoints.length,
+      queryParamGaps: paramGaps.length,
+    },
+    missingEndpoints: missingEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+    untestedEndpoints: untestedEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+    queryParamGaps: paramGaps.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+  };
+}
