@@ -6,6 +6,7 @@ import { generateTrafficCommand } from './commands/generate-traffic.js';
 import { discoverCommand } from './commands/discover.js';
 import { validateSchemasCommand } from './commands/validate-schemas.js';
 import { authCommand } from './commands/auth.js';
+import { inferSchemasCommand } from './commands/infer-schemas.js';
 
 const program = new Command();
 
@@ -21,5 +22,6 @@ program.addCommand(generateTrafficCommand);
 program.addCommand(discoverCommand);
 program.addCommand(validateSchemasCommand);
 program.addCommand(authCommand);
+program.addCommand(inferSchemasCommand);
 
 program.parse(process.argv);
