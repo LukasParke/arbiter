@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs';
+import { AuthManager } from '../auth.js';
 
 interface TrafficEntry {
   path: string;
@@ -29,12 +30,19 @@ export const generateTrafficCommand = new Command('generate-traffic')
       maxBodySize: string;
     }) => {
       const baseUrl = options.target.replace(/\/$/, '');
-      const token = options.token;
       const delay = parseInt(options.delay, 10);
       const outputPath = options.output;
       const captureBodies = options.captureBodies || false;
       const maxBodySize = parseInt(options.maxBodySize, 10);
       const traffic: TrafficEntry[] = [];
+
+      // Resolve auth: CLI token takes precedence over saved config
+      const authManager = options.token
+        ? AuthManager.fromToken(options.token)
+        : new AuthManager();
+      if (authManager.isAuthenticated()) {
+        console.info(chalk.blue('Using auth token:'), authManager.redactedToken());
+      }
 
       const endpoints = [
         { method: 'GET', path: '/' },
@@ -85,8 +93,10 @@ export const generateTrafficCommand = new Command('generate-traffic')
 
       for (const endpoint of endpoints) {
         const url = new URL(endpoint.path, baseUrl);
-        if (token) {
-          url.searchParams.set('X-Plex-Token', token);
+        // Add auth query params
+        const authParams = authManager.getQueryParams();
+        for (const [key, value] of Object.entries(authParams)) {
+          url.searchParams.set(key, value);
         }
 
         let status = 0;
@@ -94,7 +104,10 @@ export const generateTrafficCommand = new Command('generate-traffic')
         let contentType: string | undefined;
 
         try {
-          const response = await fetch(url.toString(), { method: endpoint.method });
+          const response = await fetch(url.toString(), {
+            method: endpoint.method,
+            headers: authManager.getHeaders(),
+          });
           status = response.status;
           contentType = response.headers.get('content-type') || undefined;
 

@@ -5,6 +5,7 @@ import { diffCommand } from './commands/diff.js';
 import { generateTrafficCommand } from './commands/generate-traffic.js';
 import { discoverCommand } from './commands/discover.js';
 import { validateSchemasCommand } from './commands/validate-schemas.js';
+import { authCommand } from './commands/auth.js';
 
 const program = new Command();
 
@@ -19,5 +20,6 @@ program.addCommand(diffCommand);
 program.addCommand(generateTrafficCommand);
 program.addCommand(discoverCommand);
 program.addCommand(validateSchemasCommand);
+program.addCommand(authCommand);
 
 program.parse(process.argv);
