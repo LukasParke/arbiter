@@ -8,28 +8,30 @@ export const diffCommand = new Command('diff')
   .requiredOption('-t, --traffic <path>', 'path to traffic JSONL file')
   .option('-o, --output <path>', 'path to write JSON diff report')
   .option('--exit-on-gap', 'exit with code 2 if gaps are found')
-  .action((options) => {
+  .action((options: { spec: string; traffic: string; output?: string; exitOnGap?: boolean }) => {
     const result = diffFromTraffic(options.spec, options.traffic);
-    console.log('\n' + chalk.bold('Diff Report:'));
-    console.log(JSON.stringify(result.summary, null, 2));
+    console.info('\n' + chalk.bold('Diff Report:'));
+    console.info(JSON.stringify(result.summary, null, 2));
 
     if (result.missingEndpoints.length > 0) {
-      console.log('\n' + chalk.yellow('Missing endpoints:'));
+      console.info('\n' + chalk.yellow('Missing endpoints:'));
       for (const ep of result.missingEndpoints) {
-        console.log(chalk.yellow(`  ${ep.method} ${ep.path}`));
+        console.info(chalk.yellow(`  ${ep.method} ${ep.path}`));
       }
     }
 
     if (result.queryParamGaps.length > 0) {
-      console.log('\n' + chalk.yellow('Query param gaps:'));
+      console.info('\n' + chalk.yellow('Query param gaps:'));
       for (const gap of result.queryParamGaps) {
-        console.log(chalk.yellow(`  ${gap.method} ${gap.path}: ${gap.missingQueryParams.join(', ')}`));
+        console.info(
+          chalk.yellow(`  ${gap.method} ${gap.path}: ${gap.missingQueryParams.join(', ')}`)
+        );
       }
     }
 
     if (options.output) {
       writeDiffReport(result, options.output);
-      console.log('\n' + chalk.green(`Report written to ${options.output}`));
+      console.info('\n' + chalk.green(`Report written to ${options.output}`));
     }
 
     if (options.exitOnGap && result.missingEndpoints.length > 0) {

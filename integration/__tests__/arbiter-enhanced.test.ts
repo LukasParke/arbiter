@@ -22,9 +22,15 @@ describe('Arbiter Enhanced Features', () => {
 
   // Endpoints that test path normalization
   targetApi.get('/items/123', (c) => c.json({ id: 123, type: 'numeric' }));
-  targetApi.get('/items/550e8400-e29b-41d4-a716-446655440000', (c) => c.json({ id: 'uuid', type: 'guid' }));
-  targetApi.get('/items/com.plexapp.agents.imdb://tt0137523', (c) => c.json({ id: 'plex-guid', type: 'guid' }));
-  targetApi.get('/items/some-very-long-string-key-that-is-over-thirty-chars', (c) => c.json({ id: 'key', type: 'string' }));
+  targetApi.get('/items/550e8400-e29b-41d4-a716-446655440000', (c) =>
+    c.json({ id: 'uuid', type: 'guid' })
+  );
+  targetApi.get('/items/com.plexapp.agents.imdb://tt0137523', (c) =>
+    c.json({ id: 'plex-guid', type: 'guid' })
+  );
+  targetApi.get('/items/some-very-long-string-key-that-is-over-thirty-chars', (c) =>
+    c.json({ id: 'key', type: 'string' })
+  );
 
   // Endpoint with query params
   targetApi.get('/search', (c) => {
@@ -41,28 +47,33 @@ describe('Arbiter Enhanced Features', () => {
 
     // Write a minimal spec for diff testing
     const specPath = path.join(__dirname, 'test-spec.json');
-    fs.writeFileSync(specPath, JSON.stringify({
-      openapi: '3.1.0',
-      info: { title: 'Test', version: '1.0.0' },
-      paths: {
-        '/items/{id}': {
-          get: {
-            parameters: [
-              { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
-            ],
-            responses: { '200': { description: 'OK' } },
+    fs.writeFileSync(
+      specPath,
+      JSON.stringify(
+        {
+          openapi: '3.1.0',
+          info: { title: 'Test', version: '1.0.0' },
+          paths: {
+            '/items/{id}': {
+              get: {
+                parameters: [
+                  { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+                ],
+                responses: { '200': { description: 'OK' } },
+              },
+            },
+            '/search': {
+              get: {
+                parameters: [{ name: 'q', in: 'query', schema: { type: 'string' } }],
+                responses: { '200': { description: 'OK' } },
+              },
+            },
           },
         },
-        '/search': {
-          get: {
-            parameters: [
-              { name: 'q', in: 'query', schema: { type: 'string' } },
-            ],
-            responses: { '200': { description: 'OK' } },
-          },
-        },
-      },
-    }, null, 2));
+        null,
+        2
+      )
+    );
 
     const { proxyServer: proxy, docsServer: docs } = await startServers({
       target: `http://localhost:${targetPort}`,
@@ -81,7 +92,9 @@ describe('Arbiter Enhanced Features', () => {
     proxyServer?.close();
     docsServer?.close();
     const specPath = path.join(__dirname, 'test-spec.json');
-    try { fs.unlinkSync(specPath); } catch {}
+    try {
+      fs.unlinkSync(specPath);
+    } catch {}
   });
 
   it('should export traffic as JSONL', async () => {
@@ -109,7 +122,7 @@ describe('Arbiter Enhanced Features', () => {
     await fetch(`http://localhost:${proxyPort}/items/456`);
 
     const specResponse = await fetch(`http://localhost:${docsPort}/openapi.json`);
-    const spec = await specResponse.json() as Record<string, any>;
+    const spec = (await specResponse.json()) as Record<string, any>;
 
     expect(spec.paths?.['/items/{id}']).toBeDefined();
     expect(spec.paths?.['/items/123']).toBeUndefined();
@@ -119,16 +132,18 @@ describe('Arbiter Enhanced Features', () => {
     await fetch(`http://localhost:${proxyPort}/items/550e8400-e29b-41d4-a716-446655440000`);
 
     const specResponse = await fetch(`http://localhost:${docsPort}/openapi.json`);
-    const spec = await specResponse.json() as Record<string, any>;
+    const spec = (await specResponse.json()) as Record<string, any>;
 
     expect(spec.paths?.['/items/{guid}']).toBeDefined();
   });
 
   it('should normalize long string keys to {key}', async () => {
-    await fetch(`http://localhost:${proxyPort}/items/some-very-long-string-key-that-is-over-thirty-chars`);
+    await fetch(
+      `http://localhost:${proxyPort}/items/some-very-long-string-key-that-is-over-thirty-chars`
+    );
 
     const specResponse = await fetch(`http://localhost:${docsPort}/openapi.json`);
-    const spec = await specResponse.json() as Record<string, any>;
+    const spec = (await specResponse.json()) as Record<string, any>;
 
     expect(spec.paths?.['/items/{key}']).toBeDefined();
   });
@@ -139,7 +154,7 @@ describe('Arbiter Enhanced Features', () => {
     const response = await fetch(`http://localhost:${docsPort}/diff`);
     expect(response.status).toBe(200);
 
-    const diff = await response.json() as Record<string, any>;
+    const diff = (await response.json()) as Record<string, any>;
     expect(diff).toHaveProperty('summary');
     expect(diff).toHaveProperty('missingEndpoints');
     expect(diff).toHaveProperty('untestedEndpoints');
@@ -160,7 +175,7 @@ describe('Arbiter Enhanced Features', () => {
     const response = await fetch(`http://localhost:${docsPort}/ws`);
     expect(response.status).toBe(200);
 
-    const data = await response.json() as Record<string, any>;
+    const data = (await response.json()) as Record<string, any>;
     expect(data).toHaveProperty('frames');
     expect(Array.isArray(data.frames)).toBe(true);
   });

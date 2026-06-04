@@ -1,15 +1,26 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
+import fs from 'fs';
+
+interface TrafficEntry {
+  path: string;
+  method: string;
+  queryParams: string[];
+  status: number;
+}
 
 export const generateTrafficCommand = new Command('generate-traffic')
   .description('Generate synthetic traffic against a target API')
   .requiredOption('--target <url>', 'base URL of the target API')
   .option('--token <token>', 'X-Plex-Token for authenticated requests')
   .option('--delay <ms>', 'delay between requests in ms', '100')
-  .action(async (options) => {
+  .option('-o, --output <path>', 'path to write traffic JSONL file')
+  .action(async (options: { target: string; token?: string; delay: string; output?: string }) => {
     const baseUrl = options.target.replace(/\/$/, '');
     const token = options.token;
     const delay = parseInt(options.delay, 10);
+    const outputPath = options.output;
+    const traffic: TrafficEntry[] = [];
 
     const endpoints = [
       { method: 'GET', path: '/' },
@@ -64,30 +75,49 @@ export const generateTrafficCommand = new Command('generate-traffic')
         url.searchParams.set('X-Plex-Token', token);
       }
 
+      let status = 0;
       try {
         const response = await fetch(url.toString(), { method: endpoint.method });
+        status = response.status;
         if (response.ok) {
-          console.log(chalk.green('✓'), `${endpoint.method} ${endpoint.path}`);
+          console.info(chalk.green('✓'), `${endpoint.method} ${endpoint.path}`);
           passed++;
         } else if (response.status === 401) {
-          console.log(chalk.yellow('○'), `${endpoint.method} ${endpoint.path} (unauthorized)`);
+          console.info(chalk.yellow('○'), `${endpoint.method} ${endpoint.path} (unauthorized)`);
           skipped++;
         } else {
-          console.log(chalk.red('✗'), `${endpoint.method} ${endpoint.path} (${response.status})`);
+          console.info(chalk.red('✗'), `${endpoint.method} ${endpoint.path} (${response.status})`);
           failed++;
         }
       } catch (err) {
-        console.log(chalk.red('✗'), `${endpoint.method} ${endpoint.path} (error: ${(err as Error).message})`);
+        status = 0;
+        console.info(
+          chalk.red('✗'),
+          `${endpoint.method} ${endpoint.path} (error: ${(err as Error).message})`
+        );
         failed++;
       }
+
+      traffic.push({
+        path: url.toString(),
+        method: endpoint.method,
+        queryParams: Array.from(url.searchParams.keys()),
+        status,
+      });
 
       if (delay > 0) {
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
 
-    console.log('\n' + chalk.bold('Traffic Generation Complete:'));
-    console.log(`  ${chalk.green('Passed:')} ${passed}`);
-    console.log(`  ${chalk.yellow('Skipped:')} ${skipped}`);
-    console.log(`  ${chalk.red('Failed:')} ${failed}`);
+    if (outputPath) {
+      const lines = traffic.map((entry) => JSON.stringify(entry)).join('\n');
+      fs.writeFileSync(outputPath, lines + '\n');
+      console.info(chalk.green(`Traffic written to ${outputPath}`));
+    }
+
+    console.info('\n' + chalk.bold('Traffic Generation Complete:'));
+    console.info(`  ${chalk.green('Passed:')} ${passed}`);
+    console.info(`  ${chalk.yellow('Skipped:')} ${skipped}`);
+    console.info(`  ${chalk.red('Failed:')} ${failed}`);
   });

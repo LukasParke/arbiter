@@ -14,52 +14,64 @@ export const startCommand = new Command('start')
   .option('--diff-against <path>', 'path to an existing OpenAPI spec to diff against')
   .option('--exit-on-gap', 'exit with code 2 if captured endpoints are missing from the spec')
   .option('-v, --verbose', 'enable verbose logging')
-  .action(async (options) => {
-    console.info('Starting Arbiter...');
-    const { proxyServer, docsServer } = await startServers({
-      target: options.target as string,
-      proxyPort: parseInt(options.port as string, 10),
-      docsPort: parseInt(options.docsPort as string, 10),
-      verbose: options.verbose as boolean,
-      dbPath: options.dbPath as string | undefined,
-      diffAgainst: options.diffAgainst as string | undefined,
-    });
+  .action(
+    async (options: {
+      target: string;
+      port: string;
+      docsPort: string;
+      verbose?: boolean;
+      dbPath?: string;
+      diffAgainst?: string;
+      exitOnGap?: boolean;
+    }) => {
+      console.info('Starting Arbiter...');
+      const { proxyServer, docsServer } = await startServers({
+        target: options.target,
+        proxyPort: parseInt(options.port, 10),
+        docsPort: parseInt(options.docsPort, 10),
+        verbose: options.verbose,
+        dbPath: options.dbPath,
+        diffAgainst: options.diffAgainst,
+      });
 
-    // Handle graceful shutdown with diff check
-    const shutdown = (signal: string): void => {
-      console.info(`\nReceived ${signal}, shutting down...`);
-      proxyServer.close();
-      docsServer.close();
+      // Handle graceful shutdown with diff check
+      const shutdown = (signal: string): void => {
+        console.info(`\nReceived ${signal}, shutting down...`);
+        proxyServer.close();
+        docsServer.close();
 
-      if (options.diffAgainst) {
-        try {
-          const result = diffAgainstSpec(options.diffAgainst as string);
-          console.log('\n' + chalk.bold('Diff Report:'));
-          console.log(JSON.stringify(result.summary, null, 2));
-          if (result.missingEndpoints.length > 0) {
-            console.log('\n' + chalk.yellow('Missing endpoints:'));
-            for (const ep of result.missingEndpoints) {
-              console.log(chalk.yellow(`  ${ep.method} ${ep.path}`));
+        if (options.diffAgainst) {
+          try {
+            const result = diffAgainstSpec(options.diffAgainst);
+            console.info('\n' + chalk.bold('Diff Report:'));
+            console.info(JSON.stringify(result.summary, null, 2));
+            if (result.missingEndpoints.length > 0) {
+              console.info('\n' + chalk.yellow('Missing endpoints:'));
+              for (const ep of result.missingEndpoints) {
+                console.info(chalk.yellow(`  ${ep.method} ${ep.path}`));
+              }
             }
-          }
-          if (result.queryParamGaps.length > 0) {
-            console.log('\n' + chalk.yellow('Query param gaps:'));
-            for (const gap of result.queryParamGaps) {
-              console.log(chalk.yellow(`  ${gap.method} ${gap.path}: ${gap.missingQueryParams.join(', ')}`));
+            if (result.queryParamGaps.length > 0) {
+              console.info('\n' + chalk.yellow('Query param gaps:'));
+              for (const gap of result.queryParamGaps) {
+                console.info(
+                  chalk.yellow(`  ${gap.method} ${gap.path}: ${gap.missingQueryParams.join(', ')}`)
+                );
+              }
             }
+            if (options.exitOnGap && result.missingEndpoints.length > 0) {
+              process.exit(2);
+            }
+          } catch (e) {
+            console.error(chalk.red('Diff failed:'), e);
+            process.exit(1);
           }
-          if (options.exitOnGap && result.missingEndpoints.length > 0) {
-            process.exit(2);
-          }
-        } catch (e) {
-          console.error(chalk.red('Diff failed:'), e);
-          process.exit(1);
         }
-      }
 
-      process.exit(0);
-    };
+        process.exit(0);
+      };
 
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
-  });
+      process.on('SIGTERM', () => shutdown('SIGTERM'));
+      process.on('SIGINT', () => shutdown('SIGINT'));
+    }
+  );

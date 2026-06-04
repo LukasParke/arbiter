@@ -18,7 +18,10 @@ export interface DiffResult {
 
 function normalizePath(path: string): string {
   return path
-    .replace(/\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g, '/{guid}')
+    .replace(
+      /\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g,
+      '/{guid}'
+    )
     .replace(/\/([0-9a-zA-Z_-]{30,})/g, '/{key}')
     .replace(/\/(\d+)/g, '/{id}');
 }
@@ -27,7 +30,9 @@ function extractSpecPaths(spec: OpenAPIV3_1.Document): Set<string> {
   const set = new Set<string>();
   const paths = spec.paths || {};
   for (const [path, methods] of Object.entries(paths)) {
-    if (!methods) continue;
+    if (!methods) {
+      continue;
+    }
     const norm = normalizePath(path);
     for (const method of Object.keys(methods)) {
       if (['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method)) {
@@ -48,10 +53,14 @@ function extractCapturedPaths(store: typeof openApiStore): {
 
   const paths = spec.paths || {};
   for (const [path, methods] of Object.entries(paths)) {
-    if (!methods) continue;
+    if (!methods) {
+      continue;
+    }
     const norm = normalizePath(path);
     for (const [method, operation] of Object.entries(methods)) {
-      if (!['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method)) continue;
+      if (!['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method)) {
+        continue;
+      }
       const key = `${norm}|${method.toUpperCase()}`;
       captured.add(key);
 
@@ -114,11 +123,20 @@ export function diffAgainstSpec(specPath: string): DiffResult {
   // Query param gaps: for paths present in both, which query params are in captured but not in spec?
   const paramGaps: Array<{ path: string; method: string; missingQueryParams: string[] }> = [];
   for (const key of specPaths) {
-    if (!captured.has(key)) continue;
+    if (!captured.has(key)) {
+      continue;
+    }
     const [path, method] = key.split('|');
 
-    const existingOp = Object.entries(existingSpec.paths || {}).find(([p]) => normalizePath(p) === path)?.[1] as OpenAPIV3_1.OperationObject | undefined;
-    if (!existingOp) continue;
+    const pathEntry = Object.entries(existingSpec.paths || {}).find(
+      ([p]) => normalizePath(p) === path
+    );
+    const existingOp = pathEntry
+      ? (pathEntry[1] as OpenAPIV3_1.OperationObject | undefined)
+      : undefined;
+    if (!existingOp) {
+      continue;
+    }
 
     const specParams = new Set<string>();
     for (const param of existingOp.parameters || []) {
@@ -143,9 +161,15 @@ export function diffAgainstSpec(specPath: string): DiffResult {
       untestedInSpec: untestedEndpoints.length,
       queryParamGaps: paramGaps.length,
     },
-    missingEndpoints: missingEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
-    untestedEndpoints: untestedEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
-    queryParamGaps: paramGaps.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+    missingEndpoints: missingEndpoints.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
+    untestedEndpoints: untestedEndpoints.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
+    queryParamGaps: paramGaps.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
   };
 }
 
@@ -221,11 +245,20 @@ export function diffFromTraffic(specPath: string, trafficPath: string): DiffResu
 
   const paramGaps: Array<{ path: string; method: string; missingQueryParams: string[] }> = [];
   for (const key of specPaths) {
-    if (!captured.has(key)) continue;
+    if (!captured.has(key)) {
+      continue;
+    }
     const [path, method] = key.split('|');
 
-    const existingOp = Object.entries(existingSpec.paths || {}).find(([p]) => normalizePath(p) === path)?.[1] as OpenAPIV3_1.OperationObject | undefined;
-    if (!existingOp) continue;
+    const pathEntry = Object.entries(existingSpec.paths || {}).find(
+      ([p]) => normalizePath(p) === path
+    );
+    const existingOp = pathEntry
+      ? (pathEntry[1] as OpenAPIV3_1.OperationObject | undefined)
+      : undefined;
+    if (!existingOp) {
+      continue;
+    }
 
     const specParams = new Set<string>();
     for (const param of existingOp.parameters || []) {
@@ -250,8 +283,14 @@ export function diffFromTraffic(specPath: string, trafficPath: string): DiffResu
       untestedInSpec: untestedEndpoints.length,
       queryParamGaps: paramGaps.length,
     },
-    missingEndpoints: missingEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
-    untestedEndpoints: untestedEndpoints.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
-    queryParamGaps: paramGaps.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+    missingEndpoints: missingEndpoints.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
+    untestedEndpoints: untestedEndpoints.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
+    queryParamGaps: paramGaps.sort((a, b) =>
+      `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
+    ),
   };
 }

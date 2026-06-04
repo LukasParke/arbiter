@@ -459,7 +459,10 @@ export class OpenAPIStore {
     // Convert path parameters to OpenAPI format
     // Handles: numeric IDs, UUIDs, Plex GUIDs, and long string keys
     const openApiPath = path
-      .replace(/\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g, '/{guid}')
+      .replace(
+        /\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/g,
+        '/{guid}'
+      )
       .replace(/\/([0-9a-zA-Z_-]{30,})/g, '/{key}')
       .replace(/\/(\d+)/g, '/{id}')
       .replace(/:(\w+)/g, '{$1}');

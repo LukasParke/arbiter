@@ -99,7 +99,9 @@ describe('CLI Options', () => {
 
   it('should export diff command with correct name and options', () => {
     expect(diffCommand.name()).toBe('diff');
-    expect(diffCommand.description()).toBe('Diff captured traffic against an existing OpenAPI spec');
+    expect(diffCommand.description()).toBe(
+      'Diff captured traffic against an existing OpenAPI spec'
+    );
     const options = diffCommand.options.map((o) => o.long);
     expect(options).toContain('--spec');
     expect(options).toContain('--traffic');
@@ -108,7 +110,9 @@ describe('CLI Options', () => {
 
   it('should export generate-traffic command with correct name and options', () => {
     expect(generateTrafficCommand.name()).toBe('generate-traffic');
-    expect(generateTrafficCommand.description()).toBe('Generate synthetic traffic against a target API');
+    expect(generateTrafficCommand.description()).toBe(
+      'Generate synthetic traffic against a target API'
+    );
     const options = generateTrafficCommand.options.map((o) => o.long);
     expect(options).toContain('--target');
     expect(options).toContain('--token');
