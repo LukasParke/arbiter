@@ -16,6 +16,26 @@ export interface DiffResult {
   queryParamGaps: Array<{ path: string; method: string; missingQueryParams: string[] }>;
 }
 
+export interface SchemaGap {
+  path: string;
+  method: string;
+  operationId: string;
+  category: 'missing-response-schema' | 'missing-request-schema' | 'bare-response-schema' | 'missing-param-schema';
+  detail: string;
+}
+
+export interface SchemaValidationResult {
+  summary: {
+    totalEndpoints: number;
+    missingResponseSchemas: number;
+    missingRequestSchemas: number;
+    bareResponseSchemas: number;
+    missingParamSchemas: number;
+    totalGaps: number;
+  };
+  gaps: SchemaGap[];
+}
+
 function normalizePath(path: string): string {
   return path
     .replace(
@@ -289,4 +309,157 @@ export function diffFromTraffic(specPath: string, trafficPath: string): DiffResu
       `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)
     ),
   };
+}
+
+export function validateSchemaCoverage(specPath: string): SchemaValidationResult {
+  const raw = fs.readFileSync(specPath, 'utf-8');
+  let spec: OpenAPIV3_1.Document;
+  if (specPath.endsWith('.yaml') || specPath.endsWith('.yml')) {
+    spec = parseYAML(raw) as OpenAPIV3_1.Document;
+  } else {
+    spec = JSON.parse(raw) as OpenAPIV3_1.Document;
+  }
+
+  const gaps: SchemaGap[] = [];
+  let totalEndpoints = 0;
+
+  const paths = spec.paths || {};
+  for (const [path, methods] of Object.entries(paths)) {
+    if (!methods) {continue;}
+    for (const [method, operation] of Object.entries(methods)) {
+      if (!['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method)) {
+        continue;
+      }
+      totalEndpoints++;
+      const op = operation as OpenAPIV3_1.OperationObject;
+      const opId = op.operationId || 'unknown';
+
+      // Check response schemas
+      const responses = op.responses || {};
+      for (const [code, resp] of Object.entries(responses)) {
+        if (code === '204' || code === '101') {continue;}
+        const response = resp as OpenAPIV3_1.ResponseObject;
+
+        if (!response.content || Object.keys(response.content).length === 0) {
+          if (!('$ref' in response)) {
+            gaps.push({
+              path,
+              method: method.toUpperCase(),
+              operationId: opId,
+              category: 'missing-response-schema',
+              detail: `Response ${code} has no content schema`,
+            });
+          }
+          continue;
+        }
+
+        for (const [mediaType, media] of Object.entries(response.content)) {
+          const schema = (media).schema;
+          if (!schema) {
+            gaps.push({
+              path,
+              method: method.toUpperCase(),
+              operationId: opId,
+              category: 'missing-response-schema',
+              detail: `Response ${code} (${mediaType}) has empty schema`,
+            });
+          } else if (
+            'type' in schema &&
+            schema.type === 'object' &&
+            !('properties' in schema) &&
+            !('allOf' in schema) &&
+            !('$ref' in schema)
+          ) {
+            gaps.push({
+              path,
+              method: method.toUpperCase(),
+              operationId: opId,
+              category: 'bare-response-schema',
+              detail: `Response ${code} (${mediaType}) has bare type:object with no properties`,
+            });
+          }
+        }
+      }
+
+      // Check request body schemas
+      const requestBody = op.requestBody as OpenAPIV3_1.RequestBodyObject | undefined;
+      if (requestBody && requestBody.content) {
+        for (const [mediaType, media] of Object.entries(requestBody.content)) {
+          const schema = (media).schema;
+          if (!schema) {
+            gaps.push({
+              path,
+              method: method.toUpperCase(),
+              operationId: opId,
+              category: 'missing-request-schema',
+              detail: `Request body (${mediaType}) has no schema`,
+            });
+          } else if (
+            'type' in schema &&
+            schema.type === 'object' &&
+            !('properties' in schema) &&
+            !('allOf' in schema) &&
+            !('$ref' in schema)
+          ) {
+            gaps.push({
+              path,
+              method: method.toUpperCase(),
+              operationId: opId,
+              category: 'missing-request-schema',
+              detail: `Request body (${mediaType}) has bare type:object with no properties`,
+            });
+          }
+        }
+      }
+
+      // Check parameter schemas
+      for (const param of op.parameters || []) {
+        const p = param as OpenAPIV3_1.ParameterObject;
+        if ('$ref' in p) {continue;} // skip refs
+        const pSchema = p.schema;
+        if (!pSchema) {
+          gaps.push({
+            path,
+            method: method.toUpperCase(),
+            operationId: opId,
+            category: 'missing-param-schema',
+            detail: `Parameter "${p.name}" has no schema`,
+          });
+        } else if (
+          'type' in pSchema &&
+          !pSchema.type &&
+          !('$ref' in pSchema)
+        ) {
+          gaps.push({
+            path,
+            method: method.toUpperCase(),
+            operationId: opId,
+            category: 'missing-param-schema',
+            detail: `Parameter "${p.name}" has empty schema`,
+          });
+        }
+      }
+    }
+  }
+
+  const missingResponse = gaps.filter((g) => g.category === 'missing-response-schema').length;
+  const missingRequest = gaps.filter((g) => g.category === 'missing-request-schema').length;
+  const bareResponse = gaps.filter((g) => g.category === 'bare-response-schema').length;
+  const missingParam = gaps.filter((g) => g.category === 'missing-param-schema').length;
+
+  return {
+    summary: {
+      totalEndpoints,
+      missingResponseSchemas: missingResponse,
+      missingRequestSchemas: missingRequest,
+      bareResponseSchemas: bareResponse,
+      missingParamSchemas: missingParam,
+      totalGaps: gaps.length,
+    },
+    gaps: gaps.sort((a, b) => `${a.path}|${a.method}`.localeCompare(`${b.path}|${b.method}`)),
+  };
+}
+
+export function writeSchemaValidationReport(result: SchemaValidationResult, outputPath: string): void {
+  fs.writeFileSync(outputPath, JSON.stringify(result, null, 2));
 }
