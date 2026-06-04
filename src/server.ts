@@ -153,7 +153,9 @@ export async function startServers({
   if (dbPath) {
     try {
       await initStorage(dbPath);
-      if (verbose) console.log(`Initialized SQLite storage at ${dbPath}`);
+      if (verbose) {
+        console.log(`Initialized SQLite storage at ${dbPath}`);
+      }
       // Hydrate OpenAPI store with persisted endpoints (minimal info)
       const persisted = await storage().getAllEndpoints();
       for (const ep of persisted) {

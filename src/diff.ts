@@ -85,7 +85,7 @@ export function diffAgainstSpec(specPath: string): DiffResult {
   if (specPath.endsWith('.yaml') || specPath.endsWith('.yml')) {
     existingSpec = parseYAML(raw) as OpenAPIV3_1.Document;
   } else {
-    existingSpec = JSON.parse(raw);
+    existingSpec = JSON.parse(raw) as OpenAPIV3_1.Document;
   }
   const specPaths = extractSpecPaths(existingSpec);
 
@@ -131,9 +131,7 @@ export function diffAgainstSpec(specPath: string): DiffResult {
     const pathEntry = Object.entries(existingSpec.paths || {}).find(
       ([p]) => normalizePath(p) === path
     );
-    const existingOp = pathEntry
-      ? (pathEntry[1] as OpenAPIV3_1.OperationObject | undefined)
-      : undefined;
+    const existingOp = pathEntry ? pathEntry[1] : undefined;
     if (!existingOp) {
       continue;
     }
@@ -183,7 +181,7 @@ export function diffFromTraffic(specPath: string, trafficPath: string): DiffResu
   if (specPath.endsWith('.yaml') || specPath.endsWith('.yml')) {
     existingSpec = parseYAML(raw) as OpenAPIV3_1.Document;
   } else {
-    existingSpec = JSON.parse(raw);
+    existingSpec = JSON.parse(raw) as OpenAPIV3_1.Document;
   }
   const specPaths = extractSpecPaths(existingSpec);
 
@@ -253,9 +251,7 @@ export function diffFromTraffic(specPath: string, trafficPath: string): DiffResu
     const pathEntry = Object.entries(existingSpec.paths || {}).find(
       ([p]) => normalizePath(p) === path
     );
-    const existingOp = pathEntry
-      ? (pathEntry[1] as OpenAPIV3_1.OperationObject | undefined)
-      : undefined;
+    const existingOp = pathEntry ? pathEntry[1] : undefined;
     if (!existingOp) {
       continue;
     }

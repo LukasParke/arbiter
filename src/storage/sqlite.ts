@@ -60,7 +60,9 @@ export class SQLiteStorage implements StorageAdapter {
   }
 
   async saveHarEntry(entry: any): Promise<void> {
-    if (!this.db) return;
+    if (!this.db) {
+      return;
+    }
     try {
       const stmt = this.db.prepare(
         'INSERT INTO har_entries (startedDateTime, time, request, response) VALUES (?, ?, ?, ?)'
@@ -78,7 +80,9 @@ export class SQLiteStorage implements StorageAdapter {
     const empty = {
       log: { version: '1.2', creator: { name: 'Arbiter', version: '1.0.0' }, entries: [] as any[] },
     };
-    if (!this.db) return empty;
+    if (!this.db) {
+      return empty;
+    }
     try {
       const rows = this.db
         .prepare('SELECT startedDateTime, time, request, response FROM har_entries ORDER BY id ASC')
@@ -113,14 +117,18 @@ export class SQLiteStorage implements StorageAdapter {
   }
 
   async clearHar(): Promise<void> {
-    if (!this.db) return;
+    if (!this.db) {
+      return;
+    }
     try {
       this.db.prepare('DELETE FROM har_entries').run();
     } catch {}
   }
 
   async upsertEndpoint(pathStr: string, method: string, data: any): Promise<void> {
-    if (!this.db) return;
+    if (!this.db) {
+      return;
+    }
     try {
       const stmt = this.db.prepare(
         `INSERT INTO endpoints (path, method, data) VALUES (?, ?, ?)
@@ -131,7 +139,9 @@ export class SQLiteStorage implements StorageAdapter {
   }
 
   async getAllEndpoints(): Promise<Array<{ path: string; method: string; data: any }>> {
-    if (!this.db) return [];
+    if (!this.db) {
+      return [];
+    }
     try {
       const rows = this.db.prepare('SELECT path, method, data FROM endpoints').all() as Array<{
         path: string;

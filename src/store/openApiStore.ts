@@ -156,8 +156,12 @@ export class OpenAPIStore {
   }
 
   private deepMergeSchemas(schemas: OpenAPIV3_1.SchemaObject[]): OpenAPIV3_1.SchemaObject {
-    if (schemas.length === 0) return { type: 'object' };
-    if (schemas.length === 1) return schemas[0];
+    if (schemas.length === 0) {
+      return { type: 'object' };
+    }
+    if (schemas.length === 1) {
+      return schemas[0];
+    }
 
     // If all schemas are objects, merge their properties
     if (schemas.every((s) => s.type === 'object')) {
@@ -200,9 +204,13 @@ export class OpenAPIStore {
   }
 
   private generateJsonSchema(obj: any): OpenAPIV3_1.SchemaObject {
-    if (obj === null) return { type: 'null' };
+    if (obj === null) {
+      return { type: 'null' };
+    }
     if (Array.isArray(obj)) {
-      if (obj.length === 0) return { type: 'array', items: { type: 'object' } };
+      if (obj.length === 0) {
+        return { type: 'array', items: { type: 'object' } };
+      }
 
       // Check if all items are objects with similar structure
       const allObjects = obj.every(
@@ -645,10 +653,14 @@ export class OpenAPIStore {
 
           // Try to get the raw data from our cache
           const pathMap = this.rawDataCache.get(path);
-          if (!pathMap) continue;
+          if (!pathMap) {
+            continue;
+          }
 
           const responseData = pathMap.get(method);
-          if (!responseData || !responseData.rawData) continue;
+          if (!responseData || !responseData.rawData) {
+            continue;
+          }
 
           // Get content type and encoding info
           const contentEncoding = entry.response.headers.find(
@@ -701,16 +713,22 @@ export class OpenAPIStore {
 
   // Process any raw data before generating OpenAPI specs
   private processRawData(): void {
-    if (!this.rawDataCache || this.rawDataCache.size === 0) return;
+    if (!this.rawDataCache || this.rawDataCache.size === 0) {
+      return;
+    }
 
     // Process each path and method in the raw data cache
     for (const [path, methodMap] of this.rawDataCache.entries()) {
       for (const [method, responseData] of methodMap.entries()) {
         const operation = this.getOperationForPathAndMethod(path, method);
-        if (!operation) continue;
+        if (!operation) {
+          continue;
+        }
 
-        const { rawData, status, headers = {} } = responseData as RawResponseData;
-        if (!rawData) continue;
+        const { rawData, status, headers = {} } = responseData;
+        if (!rawData) {
+          continue;
+        }
 
         // Find the response object for this status code
         const responseKey = status.toString();
@@ -723,7 +741,7 @@ export class OpenAPIStore {
           };
         }
 
-        const response = operation.responses[responseKey] as OpenAPIV3_1.ResponseObject;
+        const response = operation.responses[responseKey];
         if (!response.content) {
           response.content = {};
         }
@@ -852,7 +870,7 @@ export class OpenAPIStore {
         const [method, path] = key.split(':');
 
         if (!acc[path]) {
-          acc[path] = {} as PathItemObject;
+          acc[path] = {};
         }
 
         const operation: OpenAPIV3_1.OperationObject = {
@@ -907,7 +925,7 @@ export class OpenAPIStore {
         }
 
         // @ts-ignore - TypeScript index expression issue
-        acc[path][method.toLowerCase() as string] = operation;
+        acc[path][method.toLowerCase()] = operation;
         return acc;
       },
       {}

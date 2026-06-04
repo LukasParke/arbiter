@@ -1,7 +1,7 @@
 import { sqliteStorage } from './sqlite.js';
 import type { StorageAdapter } from './types.js';
 
-let storageInstance: StorageAdapter = sqliteStorage;
+const storageInstance: StorageAdapter = sqliteStorage;
 
 export async function initStorage(dbPath: string): Promise<StorageAdapter> {
   await storageInstance.init(dbPath);
