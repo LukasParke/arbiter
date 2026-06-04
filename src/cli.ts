@@ -8,6 +8,7 @@ import { validateSchemasCommand } from './commands/validate-schemas.js';
 import { authCommand } from './commands/auth.js';
 import { inferSchemasCommand } from './commands/infer-schemas.js';
 import { replayCommand } from './commands/replay.js';
+import { generateSpecCommand } from './commands/generate-spec.js';
 
 const program = new Command();
 
@@ -25,5 +26,6 @@ program.addCommand(validateSchemasCommand);
 program.addCommand(authCommand);
 program.addCommand(inferSchemasCommand);
 program.addCommand(replayCommand);
+program.addCommand(generateSpecCommand);
 
 program.parse(process.argv);
