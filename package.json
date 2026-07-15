@@ -9,14 +9,14 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/LukeHagar/arbiter"
+    "url": "https://github.com/LukasParke/arbiter"
   },
   "author": "Luke Hagar",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/LukeHagar/arbiter/issues"
+    "url": "https://github.com/LukasParke/arbiter/issues"
   },
-  "homepage": "https://github.com/LukeHagar/arbiter#readme",
+  "homepage": "https://github.com/LukasParke/arbiter#readme",
   "exports": {
     ".": {
       "import": "./dist/src/server.js",
