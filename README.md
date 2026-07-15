@@ -22,7 +22,7 @@ Arbiter is a powerful API proxy and documentation generator that automatically c
 ### Installation
 
 ```bash
-npm install -g @lukehagar/arbiter
+npm install -g @parke.dev/arbiter
 ```
 
 ### Basic Usage
@@ -164,8 +164,8 @@ Arbiter can also be used as middleware in your own application:
 
 ```typescript
 import express from 'express';
-import { harRecorder } from '@lukehagar/arbiter/middleware';
-import { openApiStore } from '@lukehagar/arbiter/store';
+import { harRecorder } from '@parke.dev/arbiter/middleware';
+import { openApiStore } from '@parke.dev/arbiter/store';
 
 const app = express();
 

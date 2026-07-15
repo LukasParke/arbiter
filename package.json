@@ -1,5 +1,5 @@
 {
-  "name": "@lukehagar/arbiter",
+  "name": "@parke.dev/arbiter",
   "version": "1.0.1",
   "description": "API proxy with OpenAPI generation and HAR export capabilities",
   "main": "dist/src/server.js",
