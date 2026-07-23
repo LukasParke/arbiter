@@ -70,7 +70,7 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.1",
     "@eslint/js": "^9.33.0",
-    "@hono/node-server": "^1.18.2",
+    "@hono/node-server": "^2.0.10",
     "@types/cors": "^2.8.19",
     "@types/body-parser": "^1.19.6",
     "@types/better-sqlite3": "^7.6.13",
