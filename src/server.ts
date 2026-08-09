@@ -246,9 +246,47 @@ export async function startServers({
           const startTime = Date.now();
           const chunks: Buffer[] = [];
 
-          // Collect response chunks
+          // Hop-by-hop headers must never be forwarded: Node manages response
+          // framing itself. Forwarding `transfer-encoding: chunked` and then
+          // writing a raw buffered body made clients mis-parse the framing and
+          // receive ZERO bytes (and hung SSE streams).
+          const HOP_BY_HOP = new Set([
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'te',
+            'trailer',
+            'transfer-encoding',
+            'upgrade',
+            'content-length', // unknown until the body completes; Node will chunk
+          ]);
+
+          // Forward status and end-to-end headers immediately so clients see
+          // the response start (critical for SSE/streaming APIs).
+          res.statusCode = proxyRes.statusCode || 200;
+          res.statusMessage = proxyRes.statusMessage || '';
+          Object.keys(proxyRes.headers).forEach((key) => {
+            if (HOP_BY_HOP.has(key.toLowerCase())) return;
+            const headerValue = proxyRes.headers[key];
+            if (headerValue) {
+              res.setHeader(key, headerValue);
+            }
+          });
+          if (typeof (res as any).flushHeaders === 'function') {
+            (res as any).flushHeaders();
+          }
+
+          // Stream chunks through as they arrive while teeing into the
+          // recording buffer — no client-visible buffering delay.
           proxyRes.on('data', (chunk: Buffer) => {
             chunks.push(Buffer.from(chunk));
+            res.write(chunk);
+          });
+
+          proxyRes.on('error', (err) => {
+            console.error('Upstream response error:', err);
+            if (!res.writableEnded) res.end();
           });
 
           // When the response is complete
@@ -259,20 +297,7 @@ export async function startServers({
             // Combine response chunks
             const buffer = Buffer.concat(chunks);
 
-            // Set status code
-            res.statusCode = proxyRes.statusCode || 200;
-            res.statusMessage = proxyRes.statusMessage || '';
-
-            // Copy ALL headers exactly as they are
-            Object.keys(proxyRes.headers).forEach((key) => {
-              const headerValue = proxyRes.headers[key];
-              if (headerValue) {
-                res.setHeader(key, headerValue);
-              }
-            });
-
-            // Send the buffer as the response body without modifying it
-            res.end(buffer);
+            if (!res.writableEnded) res.end();
 
             // Process HAR and OpenAPI data in the background (next event loop tick)
             // to avoid delaying the response to the client
