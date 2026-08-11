@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { AuthManager } from './auth.js';
+import { AuthManager } from '../auth.js';
 
 export interface TrafficEntry {
   path: string;

@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs';
-import { replayTraffic } from '../replay.js';
+import { replayTraffic } from '../replay/legacy.js';
 import { AuthManager } from '../auth.js';
 
 export const replayCommand = new Command('replay')
