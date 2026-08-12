@@ -37,9 +37,7 @@ export const generateTrafficCommand = new Command('generate-traffic')
       const traffic: TrafficEntry[] = [];
 
       // Resolve auth: CLI token takes precedence over saved config
-      const authManager = options.token
-        ? AuthManager.fromToken(options.token)
-        : new AuthManager();
+      const authManager = options.token ? AuthManager.fromToken(options.token) : new AuthManager();
       if (authManager.isAuthenticated()) {
         console.info(chalk.blue('Using auth token:'), authManager.redactedToken());
       }
@@ -123,7 +121,10 @@ export const generateTrafficCommand = new Command('generate-traffic')
             console.info(chalk.yellow('○'), `${endpoint.method} ${endpoint.path} (unauthorized)`);
             skipped++;
           } else {
-            console.info(chalk.red('✗'), `${endpoint.method} ${endpoint.path} (${response.status})`);
+            console.info(
+              chalk.red('✗'),
+              `${endpoint.method} ${endpoint.path} (${response.status})`
+            );
             failed++;
           }
         } catch (err) {

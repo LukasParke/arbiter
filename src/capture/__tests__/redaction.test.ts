@@ -31,7 +31,13 @@ describe('RedactionPolicy', () => {
   });
 
   it('keeps ordinary headers', () => {
-    for (const name of ['content-type', 'accept', 'user-agent', 'x-request-id', 'anthropic-version']) {
+    for (const name of [
+      'content-type',
+      'accept',
+      'user-agent',
+      'x-request-id',
+      'anthropic-version',
+    ]) {
       expect(defaultRedactionPolicy.shouldRedactHeader(name)).toBe(false);
     }
   });

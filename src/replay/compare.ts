@@ -59,7 +59,11 @@ export function compareSemanticJson(
   const ignore = new Set(normalization.ignorePointers ?? []);
   const pointer = firstJsonDiff(expectedValue, actualValue, '', ignore);
   if (pointer !== null) {
-    return { match: false, firstDiffPointer: pointer, detail: `JSON values differ at ${pointer || '/'}` };
+    return {
+      match: false,
+      firstDiffPointer: pointer,
+      detail: `JSON values differ at ${pointer || '/'}`,
+    };
   }
   return { match: true };
 }

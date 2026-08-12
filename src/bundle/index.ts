@@ -60,8 +60,10 @@ export function bundleDigest(exchanges: readonly CapturedExchange[]): string {
 }
 
 function semanticView(exchange: CapturedExchange): Record<string, unknown> {
-  const { startedAt: _startedAt, durationMs: _durationMs, ...rest } = exchange;
-  return rest;
+  const view: Record<string, unknown> = { ...exchange };
+  delete view.startedAt;
+  delete view.durationMs;
+  return view;
 }
 
 export interface WriteBundleOptions {

@@ -119,7 +119,12 @@ describe('scanExchanges', () => {
   });
 
   it('scans manifest metadata', () => {
-    const findings = scanExchanges([], new Map(), { note: 'key sk-ant-api03-abcdefghijk' }, noOptions);
+    const findings = scanExchanges(
+      [],
+      new Map(),
+      { note: 'key sk-ant-api03-abcdefghijk' },
+      noOptions
+    );
     expect(findings.length).toBeGreaterThan(0);
     expect(findings[0].location).toContain('metadata');
   });

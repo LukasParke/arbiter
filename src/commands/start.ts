@@ -15,7 +15,10 @@ export const startCommand = new Command('start')
   .option('--diff-against <path>', 'path to an existing OpenAPI spec to diff against')
   .option('--exit-on-gap', 'exit with code 2 if captured endpoints are missing from the spec')
   .option('--validate', 'validate requests and responses against an OpenAPI spec in real-time')
-  .option('-s, --spec <path>', 'path to OpenAPI spec for real-time validation (requires --validate)')
+  .option(
+    '-s, --spec <path>',
+    'path to OpenAPI spec for real-time validation (requires --validate)'
+  )
   .option('-v, --verbose', 'enable verbose logging')
   .action(
     async (options: {
@@ -28,6 +31,8 @@ export const startCommand = new Command('start')
       exitOnGap?: boolean;
       validate?: boolean;
       spec?: string;
+      proxyOnly?: boolean;
+      docsOnly?: boolean;
     }) => {
       console.info('Starting Arbiter...');
 
@@ -54,13 +59,15 @@ export const startCommand = new Command('start')
         dbPath: options.dbPath,
         diffAgainst: options.diffAgainst,
         specValidator,
+        proxyOnly: options.proxyOnly,
+        docsOnly: options.docsOnly,
       });
 
       // Handle graceful shutdown with diff check
       const shutdown = (signal: string): void => {
         console.info(`\nReceived ${signal}, shutting down...`);
-        proxyServer.close();
-        docsServer.close();
+        proxyServer?.close();
+        docsServer?.close();
 
         if (options.diffAgainst) {
           try {

@@ -70,7 +70,10 @@ describe('gateway policy enforcement', () => {
     const upstream = await startUpstream();
     const gateway = await startTestGateway(policyFor(upstream.origin));
 
-    const noAuth = await fetch(new URL('/v1/messages', gateway.url), { method: 'POST', body: '{}' });
+    const noAuth = await fetch(new URL('/v1/messages', gateway.url), {
+      method: 'POST',
+      body: '{}',
+    });
     expect(noAuth.status).toBe(401);
 
     const badToken = await fetch(new URL('/v1/messages', gateway.url), {
@@ -110,9 +113,12 @@ describe('gateway policy enforcement', () => {
     const gateway = await startTestGateway(policyFor(upstream.origin));
     const headers = { authorization: `Bearer ${TOKEN}` };
 
-    expect((await fetch(new URL('/v1/messages', gateway.url), { method: 'DELETE', headers })).status).toBe(405);
     expect(
-      (await fetch(new URL('/admin/keys', gateway.url), { method: 'POST', headers, body: '{}' })).status
+      (await fetch(new URL('/v1/messages', gateway.url), { method: 'DELETE', headers })).status
+    ).toBe(405);
+    expect(
+      (await fetch(new URL('/admin/keys', gateway.url), { method: 'POST', headers, body: '{}' }))
+        .status
     ).toBe(403);
     expect(upstream.requests).toHaveLength(0);
   });
@@ -123,10 +129,18 @@ describe('gateway policy enforcement', () => {
     const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 
     for (let i = 0; i < 2; i++) {
-      const ok = await fetch(new URL('/v1/m', gateway.url), { method: 'POST', headers, body: '{}' });
+      const ok = await fetch(new URL('/v1/m', gateway.url), {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
       expect(ok.status).toBe(200);
     }
-    const denied = await fetch(new URL('/v1/m', gateway.url), { method: 'POST', headers, body: '{}' });
+    const denied = await fetch(new URL('/v1/m', gateway.url), {
+      method: 'POST',
+      headers,
+      body: '{}',
+    });
     expect(denied.status).toBe(429);
     expect(gateway.requestCount).toBe(2);
   });
@@ -162,7 +176,9 @@ describe('gateway policy enforcement', () => {
 
   it('enforces model restrictions on JSON bodies', async () => {
     const upstream = await startUpstream();
-    const gateway = await startTestGateway(policyFor(upstream.origin, { models: ['allowed-model'] }));
+    const gateway = await startTestGateway(
+      policyFor(upstream.origin, { models: ['allowed-model'] })
+    );
     const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 
     const denied = await fetch(new URL('/v1/m', gateway.url), {
@@ -215,7 +231,9 @@ describe('credentialProviderFromCommand', () => {
   });
 
   it('applies a prefix', async () => {
-    const provider = credentialProviderFromCommand('echo tok', 'authorization', { prefix: 'Bearer' });
+    const provider = credentialProviderFromCommand('echo tok', 'authorization', {
+      prefix: 'Bearer',
+    });
     expect((await provider()).authorization).toBe('Bearer tok');
   });
 

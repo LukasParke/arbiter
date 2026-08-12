@@ -12,10 +12,7 @@ import {
   stableStringify,
   INLINE_BODY_LIMIT,
 } from '../index.js';
-import {
-  EXCHANGE_SCHEMA_VERSION,
-  type CapturedExchange,
-} from '../../capture/types.js';
+import { EXCHANGE_SCHEMA_VERSION, type CapturedExchange } from '../../capture/types.js';
 
 function makeExchange(
   sequence: number,
@@ -77,7 +74,11 @@ describe('bundle write/load', () => {
     const bodies = new Map<string, Buffer>();
     const big = Buffer.alloc(INLINE_BODY_LIMIT + 100, 0xab);
     const exchange = makeExchange(0, bodies, Buffer.from('{ "keep":  "whitespace" }'), big);
-    writeBundle(path.join(dir, 'capture'), { manifest: manifestBase, exchanges: [exchange], bodies });
+    writeBundle(path.join(dir, 'capture'), {
+      manifest: manifestBase,
+      exchanges: [exchange],
+      bodies,
+    });
 
     const bundle = loadBundle(path.join(dir, 'capture'));
     expect(bundle.exchanges).toHaveLength(1);
@@ -142,7 +143,11 @@ describe('bundle write/load', () => {
     const bodies = new Map<string, Buffer>();
     const big = Buffer.alloc(INLINE_BODY_LIMIT + 10, 0x42);
     const exchange = makeExchange(0, bodies, big);
-    writeBundle(path.join(dir, 'capture'), { manifest: manifestBase, exchanges: [exchange], bodies });
+    writeBundle(path.join(dir, 'capture'), {
+      manifest: manifestBase,
+      exchanges: [exchange],
+      bodies,
+    });
     const blobPath = path.join(dir, 'capture', 'bodies', `${exchange.request.body.sha256}.bin`);
     fs.writeFileSync(blobPath, Buffer.alloc(INLINE_BODY_LIMIT + 10, 0x43));
     const bundle = loadBundle(path.join(dir, 'capture'));
@@ -172,7 +177,11 @@ describe('bundle write/load', () => {
       storage: { kind: 'blob', path: 'bodies/../../evil.bin' },
     };
     expect(() =>
-      writeBundle(path.join(dir, 'capture'), { manifest: manifestBase, exchanges: [exchange], bodies })
+      writeBundle(path.join(dir, 'capture'), {
+        manifest: manifestBase,
+        exchanges: [exchange],
+        bodies,
+      })
     ).toThrow(/content-addressed/i);
   });
 

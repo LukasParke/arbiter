@@ -62,9 +62,7 @@ export interface CaptureSession {
 
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
-export async function startCaptureSession(
-  options: CaptureSessionOptions
-): Promise<CaptureSession> {
+export async function startCaptureSession(options: CaptureSessionOptions): Promise<CaptureSession> {
   const target = typeof options.target === 'string' ? new URL(options.target) : options.target;
   if (target.protocol !== 'http:' && target.protocol !== 'https:') {
     throw new Error(`Unsupported target protocol: ${target.protocol}`);

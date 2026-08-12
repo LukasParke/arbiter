@@ -1,6 +1,6 @@
 {
   "name": "@parke.dev/arbiter",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "API proxy with OpenAPI generation and HAR export capabilities",
   "main": "dist/src/server.js",
   "bin": {
@@ -12,7 +12,7 @@
     "url": "https://github.com/LukasParke/arbiter"
   },
   "author": "Luke Hagar",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/LukasParke/arbiter/issues"
   },
@@ -29,6 +29,26 @@
     "./store": {
       "import": "./dist/src/store/openApiStore.js",
       "types": "./dist/src/store/openApiStore.d.ts"
+    },
+    "./capture": {
+      "import": "./dist/src/capture/index.js",
+      "types": "./dist/src/capture/index.d.ts"
+    },
+    "./replay": {
+      "import": "./dist/src/replay/index.js",
+      "types": "./dist/src/replay/index.d.ts"
+    },
+    "./validation": {
+      "import": "./dist/src/validation/index.js",
+      "types": "./dist/src/validation/index.d.ts"
+    },
+    "./bundle": {
+      "import": "./dist/src/bundle/index.js",
+      "types": "./dist/src/bundle/index.d.ts"
+    },
+    "./gateway": {
+      "import": "./dist/src/gateway/index.js",
+      "types": "./dist/src/gateway/index.d.ts"
     }
   },
   "scripts": {

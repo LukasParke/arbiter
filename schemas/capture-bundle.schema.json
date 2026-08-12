@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LukasParke/arbiter/schemas/capture-bundle.schema.json",
+  "title": "Arbiter capture bundle",
+  "description": "Schemas for manifest.json and exchanges.ndjson lines in an Arbiter capture bundle (schemaVersion 1).",
+  "$defs": {
+    "capturedHeaders": {
+      "type": "object",
+      "required": ["values", "redacted"],
+      "additionalProperties": false,
+      "properties": {
+        "values": {
+          "type": "object",
+          "additionalProperties": { "type": "array", "items": { "type": "string" } }
+        },
+        "redacted": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "capturedBody": {
+      "type": "object",
+      "required": ["sha256", "size", "mediaType", "contentEncoding", "storage"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size": { "type": "integer", "minimum": 0 },
+        "mediaType": { "type": ["string", "null"] },
+        "contentEncoding": { "type": ["string", "null"] },
+        "storage": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["kind", "value"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "inline-base64" },
+                "value": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "path"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "blob" },
+                "path": { "type": "string", "pattern": "^bodies/[0-9a-f]{64}\\.bin$" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "streamState": {
+      "type": "object",
+      "required": ["kind", "completed", "clientAborted", "upstreamAborted", "terminalMarker", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["buffered", "sse", "other-stream"] },
+        "completed": { "type": "boolean" },
+        "clientAborted": { "type": "boolean" },
+        "upstreamAborted": { "type": "boolean" },
+        "terminalMarker": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "captureFailure": {
+      "type": "object",
+      "required": ["stage", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "stage": { "enum": ["request-capture", "upstream-connect", "response-capture", "persistence"] },
+        "message": { "type": "string" }
+      }
+    },
+    "exchange": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "sequence",
+        "startedAt",
+        "durationMs",
+        "request",
+        "response",
+        "failure",
+        "validation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "request": {
+          "type": "object",
+          "required": ["method", "path", "httpVersion", "headers", "body"],
+          "additionalProperties": false,
+          "properties": {
+            "method": { "type": "string" },
+            "path": { "type": "string" },
+            "httpVersion": { "type": "string" },
+            "headers": { "$ref": "#/$defs/capturedHeaders" },
+            "body": { "$ref": "#/$defs/capturedBody" }
+          }
+        },
+        "response": {
+          "type": "object",
+          "required": ["status", "statusText", "httpVersion", "headers", "body", "stream"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "type": "integer" },
+            "statusText": { "type": "string" },
+            "httpVersion": { "type": "string" },
+            "headers": { "$ref": "#/$defs/capturedHeaders" },
+            "body": { "$ref": "#/$defs/capturedBody" },
+            "stream": { "$ref": "#/$defs/streamState" }
+          }
+        },
+        "failure": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/captureFailure" }]
+        },
+        "validation": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["valid", "violationCount"],
+              "additionalProperties": false,
+              "properties": {
+                "valid": { "type": "boolean" },
+                "violationCount": { "type": "integer", "minimum": 0 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "arbiterVersion",
+        "mode",
+        "targetOrigin",
+        "startedAt",
+        "completedAt",
+        "exchangeCount",
+        "bundleDigest",
+        "redaction"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "arbiterVersion": { "type": "string" },
+        "mode": { "enum": ["observe", "exact"] },
+        "targetOrigin": { "type": "string", "format": "uri" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "exchangeCount": { "type": "integer", "minimum": 0 },
+        "bundleDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "redaction": {
+          "type": "object",
+          "required": ["redactHeaders", "allowQuery"],
+          "additionalProperties": false,
+          "properties": {
+            "redactHeaders": { "type": "array", "items": { "type": "string" } },
+            "allowQuery": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  }
+}

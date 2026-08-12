@@ -20,7 +20,11 @@ export interface SchemaGap {
   path: string;
   method: string;
   operationId: string;
-  category: 'missing-response-schema' | 'missing-request-schema' | 'bare-response-schema' | 'missing-param-schema';
+  category:
+    | 'missing-response-schema'
+    | 'missing-request-schema'
+    | 'bare-response-schema'
+    | 'missing-param-schema';
   detail: string;
 }
 
@@ -325,7 +329,9 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
 
   const paths = spec.paths || {};
   for (const [path, methods] of Object.entries(paths)) {
-    if (!methods) {continue;}
+    if (!methods) {
+      continue;
+    }
     for (const [method, operation] of Object.entries(methods)) {
       if (!['get', 'post', 'put', 'delete', 'patch', 'options', 'head'].includes(method)) {
         continue;
@@ -337,7 +343,9 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
       // Check response schemas
       const responses = op.responses || {};
       for (const [code, resp] of Object.entries(responses)) {
-        if (code === '204' || code === '101') {continue;}
+        if (code === '204' || code === '101') {
+          continue;
+        }
         const response = resp as OpenAPIV3_1.ResponseObject;
 
         if (!response.content || Object.keys(response.content).length === 0) {
@@ -354,7 +362,7 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
         }
 
         for (const [mediaType, media] of Object.entries(response.content)) {
-          const schema = (media).schema;
+          const schema = media.schema;
           if (!schema) {
             gaps.push({
               path,
@@ -385,7 +393,7 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
       const requestBody = op.requestBody as OpenAPIV3_1.RequestBodyObject | undefined;
       if (requestBody && requestBody.content) {
         for (const [mediaType, media] of Object.entries(requestBody.content)) {
-          const schema = (media).schema;
+          const schema = media.schema;
           if (!schema) {
             gaps.push({
               path,
@@ -415,7 +423,9 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
       // Check parameter schemas
       for (const param of op.parameters || []) {
         const p = param as OpenAPIV3_1.ParameterObject;
-        if ('$ref' in p) {continue;} // skip refs
+        if ('$ref' in p) {
+          continue;
+        } // skip refs
         const pSchema = p.schema;
         if (!pSchema) {
           gaps.push({
@@ -425,11 +435,7 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
             category: 'missing-param-schema',
             detail: `Parameter "${p.name}" has no schema`,
           });
-        } else if (
-          'type' in pSchema &&
-          !pSchema.type &&
-          !('$ref' in pSchema)
-        ) {
+        } else if ('type' in pSchema && !pSchema.type && !('$ref' in pSchema)) {
           gaps.push({
             path,
             method: method.toUpperCase(),
@@ -460,6 +466,9 @@ export function validateSchemaCoverage(specPath: string): SchemaValidationResult
   };
 }
 
-export function writeSchemaValidationReport(result: SchemaValidationResult, outputPath: string): void {
+export function writeSchemaValidationReport(
+  result: SchemaValidationResult,
+  outputPath: string
+): void {
   fs.writeFileSync(outputPath, JSON.stringify(result, null, 2));
 }

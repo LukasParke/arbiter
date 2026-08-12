@@ -9,6 +9,10 @@ import { authCommand } from './commands/auth.js';
 import { inferSchemasCommand } from './commands/infer-schemas.js';
 import { replayCommand } from './commands/replay.js';
 import { generateSpecCommand } from './commands/generate-spec.js';
+import { captureCommand } from './commands/capture.js';
+import { sanitizeCommand } from './commands/sanitize.js';
+import { validateBundleCommand } from './commands/validate-bundle.js';
+import { gatewayCommand } from './commands/gateway.js';
 
 const program = new Command();
 
@@ -27,5 +31,9 @@ program.addCommand(authCommand);
 program.addCommand(inferSchemasCommand);
 program.addCommand(replayCommand);
 program.addCommand(generateSpecCommand);
+program.addCommand(captureCommand);
+program.addCommand(sanitizeCommand);
+program.addCommand(validateBundleCommand);
+program.addCommand(gatewayCommand);
 
 program.parse(process.argv);

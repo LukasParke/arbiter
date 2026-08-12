@@ -39,7 +39,9 @@ export class AuthManager {
   }
 
   saveToDisk(): void {
-    if (!this.config) {return;}
+    if (!this.config) {
+      return;
+    }
     try {
       if (!fs.existsSync(AUTH_CONFIG_DIR)) {
         fs.mkdirSync(AUTH_CONFIG_DIR, { recursive: true });
@@ -51,7 +53,9 @@ export class AuthManager {
   }
 
   getHeaders(): Record<string, string> {
-    if (!this.config) {return {};}
+    if (!this.config) {
+      return {};
+    }
 
     switch (this.config.type) {
       case 'plex-token':
@@ -66,7 +70,9 @@ export class AuthManager {
   }
 
   getQueryParams(): Record<string, string> {
-    if (!this.config) {return {};}
+    if (!this.config) {
+      return {};
+    }
 
     if (this.config.type === 'plex-token') {
       return { 'X-Plex-Token': this.config.token };
@@ -82,9 +88,13 @@ export class AuthManager {
   }
 
   redactedToken(): string {
-    if (!this.config) {return 'none';}
+    if (!this.config) {
+      return 'none';
+    }
     const t = this.config.token;
-    if (t.length <= 8) {return '***';}
+    if (t.length <= 8) {
+      return '***';
+    }
     return `${t.slice(0, 4)}...${t.slice(-4)}`;
   }
 }

@@ -135,7 +135,7 @@ describe('exact capture byte fidelity', () => {
     const reader = res.body!.getReader();
 
     const first = await reader.read();
-    expect(Buffer.from(first.value!).toString('utf-8')).toContain('message_start');
+    expect(Buffer.from(first.value ?? []).toString('utf-8')).toContain('message_start');
     // Upstream has not finished yet — first chunk already delivered.
     sendSecond!();
     let rest = '';
@@ -144,7 +144,7 @@ describe('exact capture byte fidelity', () => {
       if (chunk.done) {
         break;
       }
-      rest += Buffer.from(chunk.value!).toString('utf-8');
+      rest += Buffer.from(chunk.value ?? []).toString('utf-8');
     }
     expect(rest).toContain('message_stop');
     await session.waitForIdle();
@@ -274,7 +274,9 @@ describe('exact capture byte fidelity', () => {
     }
     await session.waitForIdle();
     const out = tmpdir();
-    await expect(session.export({ output: path.join(out, 'c') })).rejects.toThrow(/fail(ed)? closed/i);
+    await expect(session.export({ output: path.join(out, 'c') })).rejects.toThrow(
+      /fail(ed)? closed/i
+    );
   });
 
   it('spills large bodies without truncation under spill policy', async () => {
@@ -284,7 +286,10 @@ describe('exact capture byte fidelity', () => {
     });
     cleanups.push(() => void upstream.server.close());
 
-    const session = await startSession(upstream.url, { maxBodyBytes: 16, bodyLimitPolicy: 'spill' });
+    const session = await startSession(upstream.url, {
+      maxBodyBytes: 16,
+      bodyLimitPolicy: 'spill',
+    });
     const payload = Buffer.alloc(1024, 0x61);
     await (
       await fetch(new URL('/big', session.url), { method: 'POST', body: payload })
@@ -355,12 +360,14 @@ describe('exact capture byte fidelity', () => {
     const reloaded = loadBundle(path.join(out, 'capture'));
     expect(reloaded.manifest.bundleDigest).toBe(manifest.bundleDigest);
 
-    const har = exchangesToHar(reloaded.exchanges, reloaded.manifest.targetOrigin, reloaded.readBody);
+    const har = exchangesToHar(reloaded.exchanges, reloaded.manifest.targetOrigin, (b) =>
+      reloaded.readBody(b)
+    );
     expect(har.log.entries).toHaveLength(1);
     expect(har.log.entries[0].request.postData?.text).toBe('{"model":"m"}');
     expect(har.log.entries[0].response.content.text).toBe('{"ok":true}');
 
-    const jsonl = exchangesToTrafficJsonl(reloaded.exchanges, reloaded.readBody);
+    const jsonl = exchangesToTrafficJsonl(reloaded.exchanges, (b) => reloaded.readBody(b));
     const line = JSON.parse(jsonl.trim());
     expect(line.method).toBe('POST');
     expect(line.response_status).toBe(200);
@@ -380,7 +387,9 @@ describe('exact capture byte fidelity', () => {
 
     const out = tmpdir();
     const { bundle } = await session.export({ output: path.join(out, 'c') });
-    const har = exchangesToHar(bundle.exchanges, bundle.manifest.targetOrigin, bundle.readBody);
+    const har = exchangesToHar(bundle.exchanges, bundle.manifest.targetOrigin, (b) =>
+      bundle.readBody(b)
+    );
     const content = har.log.entries[0].response.content;
     expect(content.encoding).toBe('base64');
     expect(Buffer.from(content.text, 'base64').equals(binary)).toBe(true);

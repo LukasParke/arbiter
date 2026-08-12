@@ -83,7 +83,12 @@ export function validatePolicy(policy: GatewayPolicy): void {
   if (policy.methods.length === 0 || policy.pathPrefixes.length === 0) {
     throw new Error('policy.methods and policy.pathPrefixes must be non-empty');
   }
-  for (const field of ['maxRequests', 'maxRequestBytes', 'maxResponseBytes', 'maxDurationMs'] as const) {
+  for (const field of [
+    'maxRequests',
+    'maxRequestBytes',
+    'maxResponseBytes',
+    'maxDurationMs',
+  ] as const) {
     if (!Number.isFinite(policy[field]) || policy[field] <= 0) {
       throw new Error(`policy.${field} must be a positive number`);
     }
@@ -126,13 +131,19 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
       }
       if (!clientRes.writableEnded) {
         clientRes.end(
-          JSON.stringify({ error: 'gateway_error', message: err instanceof Error ? err.message : 'unknown' })
+          JSON.stringify({
+            error: 'gateway_error',
+            message: err instanceof Error ? err.message : 'unknown',
+          })
         );
       }
     });
   });
 
-  async function handle(clientReq: http.IncomingMessage, clientRes: http.ServerResponse): Promise<void> {
+  async function handle(
+    clientReq: http.IncomingMessage,
+    clientRes: http.ServerResponse
+  ): Promise<void> {
     const method = clientReq.method ?? 'GET';
     const path = clientReq.url ?? '/';
 
@@ -243,7 +254,13 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     try {
       [upstreamRes] = (await once(upstreamReq, 'response')) as [http.IncomingMessage];
     } catch (err) {
-      deny(clientRes, method, path, 502, `upstream error: ${err instanceof Error ? err.message : 'unknown'}`);
+      deny(
+        clientRes,
+        method,
+        path,
+        502,
+        `upstream error: ${err instanceof Error ? err.message : 'unknown'}`
+      );
       return;
     }
 
@@ -293,7 +310,9 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
   }
 
   return {
-    url: new URL(`http://${address.address.includes(':') ? `[${address.address}]` : address.address}:${address.port}`),
+    url: new URL(
+      `http://${address.address.includes(':') ? `[${address.address}]` : address.address}:${address.port}`
+    ),
     get requestCount(): number {
       return served;
     },

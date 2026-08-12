@@ -127,8 +127,7 @@ export async function replayTraffic(
   const failed = results.filter((r) => !r.statusMatch && !r.error).length;
   const errors = results.filter((r) => r.error).length;
   const passed = total - failed - errors;
-  const avgDurationMs =
-    total > 0 ? results.reduce((sum, r) => sum + r.durationMs, 0) / total : 0;
+  const avgDurationMs = total > 0 ? results.reduce((sum, r) => sum + r.durationMs, 0) / total : 0;
 
   return {
     results,
@@ -158,8 +157,12 @@ function compareBodies(original: string, replayed: string): string | undefined {
       const extra = replayKeys.filter((k) => !origKeys.includes(k));
       if (missing.length > 0 || extra.length > 0) {
         const parts: string[] = [];
-        if (missing.length > 0) {parts.push(`missing keys: ${missing.join(', ')}`);}
-        if (extra.length > 0) {parts.push(`extra keys: ${extra.join(', ')}`);}
+        if (missing.length > 0) {
+          parts.push(`missing keys: ${missing.join(', ')}`);
+        }
+        if (extra.length > 0) {
+          parts.push(`extra keys: ${extra.join(', ')}`);
+        }
         return `Shape diff: ${parts.join('; ')}`;
       }
     }
@@ -175,7 +178,11 @@ function compareBodies(original: string, replayed: string): string | undefined {
 }
 
 function getType(value: unknown): string {
-  if (value === null) {return 'null';}
-  if (Array.isArray(value)) {return 'array';}
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
   return typeof value;
 }

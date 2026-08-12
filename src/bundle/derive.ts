@@ -155,10 +155,7 @@ function isTextual(body: CapturedBody): boolean {
   );
 }
 
-function encodeContent(
-  bytes: Buffer,
-  body: CapturedBody
-): { text: string; encoding?: 'base64' } {
+function encodeContent(bytes: Buffer, body: CapturedBody): { text: string; encoding?: 'base64' } {
   if (isTextual(body)) {
     return { text: bytes.toString('utf-8') };
   }

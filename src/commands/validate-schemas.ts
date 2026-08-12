@@ -24,7 +24,9 @@ export const validateSchemasCommand = new Command('validate-schemas')
     console.info(
       `  Missing parameter schemas: ${result.summary.missingParamSchemas > 0 ? chalk.red(String(result.summary.missingParamSchemas)) : chalk.green('0')}`
     );
-    console.info(`  Total gaps: ${result.summary.totalGaps > 0 ? chalk.red(String(result.summary.totalGaps)) : chalk.green('0')}`);
+    console.info(
+      `  Total gaps: ${result.summary.totalGaps > 0 ? chalk.red(String(result.summary.totalGaps)) : chalk.green('0')}`
+    );
 
     if (result.gaps.length > 0) {
       const byCategory = new Map<string, SchemaGap[]>();

@@ -18,9 +18,7 @@ export interface CapturedHeaders {
   redacted: string[];
 }
 
-export type BodyStorage =
-  | { kind: 'inline-base64'; value: string }
-  | { kind: 'blob'; path: string };
+export type BodyStorage = { kind: 'inline-base64'; value: string } | { kind: 'blob'; path: string };
 
 export interface CapturedBody {
   sha256: string;

@@ -123,9 +123,9 @@ describe('replayCapture', () => {
     expect(report.summary.passed).toBe(1);
     expect(replayTarget.requests[0].headers.authorization).toBe('Bearer sk-injected');
     // The stored bundle remains credential-free
-    expect(
-      JSON.stringify(bundle.exchanges.map((e) => e.request.headers))
-    ).not.toContain('sk-injected');
+    expect(JSON.stringify(bundle.exchanges.map((e) => e.request.headers))).not.toContain(
+      'sk-injected'
+    );
   });
 
   it('supports env-mapping credential providers', async () => {
@@ -133,9 +133,7 @@ describe('replayCapture', () => {
     cleanups.push(() => {
       delete process.env.ARBITER_TEST_KEY;
     });
-    const provider = credentialProviderFromEnvMappings([
-      'ARBITER_TEST_KEY:authorization:Bearer',
-    ]);
+    const provider = credentialProviderFromEnvMappings(['ARBITER_TEST_KEY:authorization:Bearer']);
     const headers = await provider(null as never);
     expect(headers.authorization).toBe('Bearer test-value-123');
   });
@@ -175,7 +173,9 @@ describe('replayCapture', () => {
       res.end(sse('msg_original'));
     });
     const bundle = await captureOne(original.url, async (proxyUrl) => {
-      await (await fetch(new URL('/v1/messages', proxyUrl), { method: 'POST', body: '{}' })).arrayBuffer();
+      await (
+        await fetch(new URL('/v1/messages', proxyUrl), { method: 'POST', body: '{}' })
+      ).arrayBuffer();
     });
 
     const replayTarget = await startServer((_req, res) => {
