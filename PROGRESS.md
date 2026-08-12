@@ -48,7 +48,9 @@ PR: https://github.com/LukasParke/arbiter/pull/33
 
 - Clean-context security review run; C1–C5/H2/H3 hardened (generic client-facing errors, spill cleanup on abnormal death, credential ref dropped in finally) — commit e065bc1
 - CI workflow was broken repo-wide (pnpm 11 via version:latest needs Node >= 22.13; every matrix job failed at install). Fixed: pnpm pinned to 10, lint once on Node 22, new build job with export/CLI smoke, tests on ubuntu+macos × Node 20/22/24 — commit 1f15767
-- Monitoring CI + reviews via sentinel `arbiter-pr33-ci`
+- CI fully green (lint, build+export smoke, tests on ubuntu+macos × Node 20/22/24) as of 363a9a5
+- CommandValidator stdin EPIPE race fixed (Linux CI caught it; validator exiting before reading stdin)
+- CodeRabbit rate-limited; retriggering when the limit resets, then driving threads to zero
 
 ## Blockers
 
