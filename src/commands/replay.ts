@@ -17,6 +17,7 @@ interface ReplayCliOptions {
   mode: string;
   credentialEnv: string[];
   ignorePointer: string[];
+  queryEnv: string[];
   token?: string;
   onlyStatus?: boolean;
   delay: string;
@@ -50,6 +51,12 @@ export const replayCommand = new Command('replay')
     []
   )
   .option('--ignore-pointer <pointer>', 'volatile JSON pointer to ignore (repeatable)', collect, [])
+  .option(
+    '--query-env <mapping>',
+    'NAME:ENV replacement for a capture-redacted query value (repeatable)',
+    collect,
+    []
+  )
   .option('--token <token>', '(legacy) authentication token for replayed requests')
   .option('--only-status', '(legacy) only compare status codes')
   .option('--delay <ms>', 'delay between requests in milliseconds', '0')
@@ -84,12 +91,32 @@ export const replayCommand = new Command('replay')
       options.target
     );
 
+    const queryReplacements = new Map<string, string>();
+    for (const mapping of options.queryEnv) {
+      const [name, envName] = mapping.split(':');
+      if (!name || !envName) {
+        console.error(chalk.red(`Invalid --query-env mapping: ${mapping} (expected NAME:ENV)`));
+        process.exit(1);
+      }
+      const value = process.env[envName];
+      if (value === undefined) {
+        console.error(
+          chalk.red(`--query-env ${mapping}: environment variable ${envName} is not set`)
+        );
+        process.exit(1);
+      }
+      queryReplacements.set(name, value);
+    }
+
     const report = await replayCapture(bundle, {
       target: options.target,
       mode: options.mode as ReplayComparisonMode,
       delayMs: parseInt(options.delay, 10),
       ...(options.credentialEnv.length > 0
         ? { credentialProvider: credentialProviderFromEnvMappings(options.credentialEnv) }
+        : {}),
+      ...(queryReplacements.size > 0
+        ? { queryValueProvider: (name: string): string | undefined => queryReplacements.get(name) }
         : {}),
       ...(options.ignorePointer.length > 0
         ? { normalization: { ignorePointers: options.ignorePointer } }

@@ -150,7 +150,9 @@ arbiter replay ./capture \
   --fail-on-diff
 ```
 
-Modes: `status-only`, `exact-response-body` (first differing byte offset), `semantic-json-response` (first differing JSON pointer), `semantic-sse-response` (ordered events with declared volatile pointers). Replay resends the recorded method, path/query, safe headers, and exact body bytes. Redacted credentials are only re-injected through `--credential-env` or a credential-provider callback — never stored. Legacy traffic JSONL replays remain available via `--legacy-jsonl` (or by passing a file path).
+Modes: `status-only`, `exact-response-body` (first differing byte offset), `semantic-json-response` (first differing JSON pointer), `semantic-sse-response` (ordered events with declared volatile pointers; non-SSE exchanges fail loudly rather than matching vacuously). Replay resends the recorded method, path/query, safe headers, and exact body bytes. Redacted credentials are only re-injected through `--credential-env` or a credential-provider callback — never stored.
+
+**Redaction limits replayability by design.** A query value redacted at capture is not replayable: Arbiter never sends invented placeholder values to a target. Such exchanges fail as unreplayable unless a replacement is supplied via `--query-env NAME:ENV_VAR` (or a `queryValueProvider` callback in library use). The same applies to redacted headers and `--credential-env`. Legacy traffic JSONL replays remain available via `--legacy-jsonl` (or by passing a file path).
 
 ### Sanitize and validate
 
@@ -200,7 +202,8 @@ const report = await replayCapture(loadBundle('./capture'), {
 - Query parameter values are redacted by default; names are retained. Allow specific keys with `--allow-query`.
 - Exact exports secret-scan the manifest, headers, paths, and textual bodies for caller-supplied exact values (`--reject-secret ENV_NAME`) and common credential patterns (Anthropic/OpenAI/OpenRouter keys, GitHub tokens, AWS key ids, Google API keys, JWTs, PEM keys, Bearer/Basic values). Any finding fails the export; findings never contain the full secret.
 - Unexpected binary bodies fail exact export unless their media type is explicitly allowed.
-- Bundle output directories are created `0700`, files `0600`.
+- Bundle output directories are created `0700`, files `0600`; output roots are realpath-resolved so writes never follow a symlinked directory.
+- `loadBundle` treats bundles as hostile input: every manifest/exchange field is runtime-validated with bounded sizes before allocation, sequences must be strictly increasing, base64 must be well-formed and consistent with declared sizes, digests are verified, and file reads reject symlinks at every path component under the bundle root.
 
 ## How It Works
 

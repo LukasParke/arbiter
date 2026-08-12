@@ -14,6 +14,7 @@ import https from 'https';
 import { once } from 'events';
 import { sha256Hex, type CaptureBundle } from '../bundle/index.js';
 import { HOP_BY_HOP_HEADERS } from '../capture/headers.js';
+import { redactedQueryNames, REDACTED_VALUE } from '../capture/redaction.js';
 import type { CapturedExchange } from '../capture/types.js';
 import {
   compareExactBytes,
@@ -45,10 +46,19 @@ export type CredentialProvider = (
   exchange: CapturedExchange
 ) => Promise<Record<string, string>> | Record<string, string>;
 
+/**
+ * Supplies replacement values for query parameters whose values were
+ * redacted at capture. Returning undefined for a name leaves the exchange
+ * unreplayable: Arbiter never invents query values.
+ */
+export type QueryValueProvider = (name: string, exchange: CapturedExchange) => string | undefined;
+
 export interface ReplayOptions {
   target: URL | string;
   mode: ReplayComparisonMode;
   credentialProvider?: CredentialProvider;
+  /** Replacements for capture-redacted query values. */
+  queryValueProvider?: QueryValueProvider;
   normalization?: SseNormalization & JsonNormalization;
   /** Delay between requests in ms. */
   delayMs?: number;
@@ -164,6 +174,44 @@ async function replayExchange(
     normalizationApplied,
   };
 
+  // A redacted query value is not replayable: sending the placeholder
+  // upstream would call the target with invented data. Either a provider
+  // supplies every replacement or the exchange fails as unreplayable.
+  let replayPath = exchange.request.path;
+  const redactedNames = redactedQueryNames(replayPath);
+  if (redactedNames.length > 0) {
+    const missing: string[] = [];
+    const queryStart = replayPath.indexOf('?');
+    const params = new URLSearchParams(replayPath.slice(queryStart + 1));
+    const rebuilt = new URLSearchParams();
+    for (const [name, value] of params) {
+      if (value === REDACTED_VALUE) {
+        const replacement = options.queryValueProvider?.(name, exchange);
+        if (replacement === undefined) {
+          if (!missing.includes(name)) {
+            missing.push(name);
+          }
+          continue;
+        }
+        rebuilt.append(name, replacement);
+      } else {
+        rebuilt.append(name, value);
+      }
+    }
+    if (missing.length > 0) {
+      return {
+        ...base,
+        transportSuccess: false,
+        replayedStatus: null,
+        statusMatch: false,
+        comparison: null,
+        error: `Unreplayable: query value(s) redacted at capture with no replacement provided: ${missing.join(', ')}`,
+        durationMs: Date.now() - start,
+      };
+    }
+    replayPath = `${replayPath.slice(0, queryStart)}?${rebuilt.toString()}`;
+  }
+
   try {
     const headers: Record<string, string | string[]> = {};
     for (const [name, values] of Object.entries(exchange.request.headers.values)) {
@@ -190,7 +238,7 @@ async function replayExchange(
       hostname: target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       method: exchange.request.method,
-      path: exchange.request.path,
+      path: replayPath,
       headers,
       rejectUnauthorized: options.rejectUnauthorized ?? true,
       timeout: options.timeoutMs ?? 120_000,

@@ -87,21 +87,31 @@ describe('replayCapture', () => {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"ok":true}');
     });
+    // The captured query value was redacted, so replay without a query
+    // value provider must fail as unreplayable rather than send the
+    // placeholder upstream.
+    const unreplayable = await replayCapture(bundle, {
+      target: replayTarget.url,
+      mode: 'semantic-json-response',
+    });
+    expect(unreplayable.summary.errors).toBe(1);
+    expect(unreplayable.results[0].error).toMatch(/unreplayable/i);
+    expect(replayTarget.requests).toHaveLength(0);
+
+    // With a provider supplying the replacement, replay proceeds exactly.
     const report = await replayCapture(bundle, {
       target: replayTarget.url,
       mode: 'semantic-json-response',
+      queryValueProvider: (name) => (name === 'page' ? 'x' : undefined),
     });
 
     expect(report.summary.passed).toBe(1);
     const sent = replayTarget.requests[0];
     expect(sent.body.toString('utf-8')).toBe(oddBody);
     expect(sent.method).toBe('POST');
-    // Path and query names replay exactly; the query VALUE was redacted at
-    // capture per policy, so the redaction placeholder is what replays.
-    const recordedPath = bundle.exchanges[0].request.path;
-    expect(sent.url).toBe(recordedPath);
     expect(sent.url.split('?')[0]).toBe('/v1/messages');
-    expect(sent.url).toContain('page=');
+    expect(new URL(sent.url, replayTarget.url).searchParams.get('page')).toBe('x');
+    expect(sent.url).not.toContain('__redacted__');
     expect(sent.headers['x-request-tag']).toBe('replay-me');
     expect(sent.headers['content-type']).toBe('application/json');
     // Redacted credential is NOT replayed

@@ -15,8 +15,14 @@ import fs from 'fs';
 import path from 'path';
 import { stableStringify } from './stableJson.js';
 import {
+  BUNDLE_LIMITS,
+  BundleValidationError,
+  validateExchange,
+  validateManifest,
+  validateSequenceOrder,
+} from './validate.js';
+import {
   BUNDLE_SCHEMA_VERSION,
-  EXCHANGE_SCHEMA_VERSION,
   type CapturedExchange,
   type CapturedBody,
   type CaptureManifest,
@@ -30,6 +36,7 @@ export {
   type HarEntry,
   type TrafficLine,
 } from './derive.js';
+export { BundleValidationError, BUNDLE_LIMITS } from './validate.js';
 
 export const INLINE_BODY_LIMIT = 8 * 1024;
 
@@ -78,10 +85,15 @@ export interface WriteBundleOptions {
  * owner-only permissions; blob files are content-addressed by sha256.
  */
 export function writeBundle(outputDir: string, options: WriteBundleOptions): CaptureManifest {
-  const root = path.resolve(outputDir);
+  let root = path.resolve(outputDir);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  // Never write through a symlinked output root (symlink-overwrite hardening).
+  root = fs.realpathSync(root);
   const bodiesDir = path.join(root, 'bodies');
   fs.mkdirSync(bodiesDir, { recursive: true, mode: 0o700 });
+  if (fs.lstatSync(bodiesDir).isSymbolicLink()) {
+    throw new Error(`Refusing to write through symlinked bodies directory: ${bodiesDir}`);
+  }
 
   const exchanges = [...options.exchanges].sort((a, b) => a.sequence - b.sequence);
 
@@ -136,32 +148,55 @@ function writeFileAtomic(filePath: string, data: Buffer): void {
 }
 
 /**
- * Load and verify a bundle. Rejects path traversal, symlinked entries, digest
- * mismatches, and unknown schema versions. Untrusted bundles are safe to load.
+ * Load and verify a bundle. Every field is runtime-validated with bounded
+ * sizes before allocation, sequences must be strictly increasing, digests
+ * are verified, and all file reads are confined to the bundle root with
+ * symlinks rejected at every path component. Untrusted bundles are safe to
+ * load.
  */
 export function loadBundle(bundleDir: string): CaptureBundle {
   const root = fs.realpathSync(path.resolve(bundleDir));
 
-  const manifestPath = safeJoin(root, 'manifest.json');
-  const manifestRaw = readRegularFile(manifestPath);
-  const manifest = JSON.parse(manifestRaw.toString('utf-8')) as CaptureManifest;
-  if (manifest.schemaVersion !== BUNDLE_SCHEMA_VERSION) {
-    throw new Error(`Unsupported bundle schemaVersion: ${String(manifest.schemaVersion)}`);
+  const manifestRaw = readContainedFile(root, ['manifest.json'], BUNDLE_LIMITS.maxManifestBytes);
+  let manifestParsed: unknown;
+  try {
+    manifestParsed = JSON.parse(manifestRaw.toString('utf-8'));
+  } catch {
+    throw new BundleValidationError('manifest.json', 'not valid JSON');
   }
+  const manifest = validateManifest(manifestParsed);
 
-  const exchangesRaw = readRegularFile(safeJoin(root, 'exchanges.ndjson')).toString('utf-8');
+  const exchangesRaw = readContainedFile(
+    root,
+    ['exchanges.ndjson'],
+    BUNDLE_LIMITS.maxExchanges * BUNDLE_LIMITS.maxNdjsonLineBytes
+  ).toString('utf-8');
   const exchanges: CapturedExchange[] = [];
   for (const line of exchangesRaw.split('\n')) {
     if (line.trim().length === 0) {
       continue;
     }
-    const exchange = JSON.parse(line) as CapturedExchange;
-    if (exchange.schemaVersion !== EXCHANGE_SCHEMA_VERSION) {
-      throw new Error(`Unsupported exchange schemaVersion: ${String(exchange.schemaVersion)}`);
+    if (Buffer.byteLength(line) > BUNDLE_LIMITS.maxNdjsonLineBytes) {
+      throw new BundleValidationError(
+        `exchange[${exchanges.length}]`,
+        `NDJSON line exceeds ${BUNDLE_LIMITS.maxNdjsonLineBytes} bytes`
+      );
     }
-    exchanges.push(exchange);
+    if (exchanges.length >= BUNDLE_LIMITS.maxExchanges) {
+      throw new BundleValidationError(
+        'exchanges.ndjson',
+        `more than ${BUNDLE_LIMITS.maxExchanges} exchanges`
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      throw new BundleValidationError(`exchange[${exchanges.length}]`, 'not valid JSON');
+    }
+    exchanges.push(validateExchange(parsed, exchanges.length));
   }
-  exchanges.sort((a, b) => a.sequence - b.sequence);
+  validateSequenceOrder(exchanges);
 
   if (exchanges.length !== manifest.exchangeCount) {
     throw new Error(
@@ -185,7 +220,7 @@ export function loadBundle(bundleDir: string): CaptureBundle {
       if (body.storage.path !== expected) {
         throw new Error(`Blob path ${body.storage.path} is not content-addressed`);
       }
-      bytes = readRegularFile(safeJoin(root, 'bodies', `${body.sha256}.bin`));
+      bytes = readContainedFile(root, ['bodies', `${body.sha256}.bin`], body.size);
     }
     if (bytes.length !== body.size) {
       throw new Error(`Body size mismatch for ${body.sha256}`);
@@ -214,13 +249,39 @@ export function safeJoin(root: string, ...segments: string[]): string {
   return joined;
 }
 
-function readRegularFile(filePath: string): Buffer {
-  const stat = fs.lstatSync(filePath);
-  if (stat.isSymbolicLink()) {
-    throw new Error(`Refusing to read symlink in bundle: ${filePath}`);
+/**
+ * Read a file strictly contained under `root` (which must already be a
+ * realpath): every intermediate component is lstat-checked so a symlinked
+ * directory (e.g. bodies/ -> /etc) cannot escape, the leaf must be a regular
+ * non-symlink file, its realpath must remain under root, and its size must
+ * not exceed `maxBytes` before any allocation happens.
+ */
+function readContainedFile(root: string, segments: string[], maxBytes: number): Buffer {
+  const filePath = safeJoin(root, ...segments);
+
+  // Reject symlinks at every path component between root and the leaf.
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing symlinked bundle path component: ${current}`);
+    }
   }
+
+  const stat = fs.lstatSync(filePath);
   if (!stat.isFile()) {
     throw new Error(`Not a regular file: ${filePath}`);
+  }
+  if (stat.size > maxBytes) {
+    throw new Error(`File exceeds permitted size (${stat.size} > ${maxBytes}): ${filePath}`);
+  }
+
+  // Defense in depth against TOCTOU swaps: the resolved path of what we
+  // actually open must still live under the bundle root.
+  const real = fs.realpathSync(filePath);
+  if (real !== filePath && !real.startsWith(root + path.sep)) {
+    throw new Error(`Bundle file escapes root after resolution: ${filePath}`);
   }
   return fs.readFileSync(filePath);
 }

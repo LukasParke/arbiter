@@ -69,6 +69,16 @@ Blocking gap fixed: **gateway now composes with CaptureSession**. `GatewayOption
 
 197 tests passing (was 189).
 
+## Second parent audit remediation (trust boundaries)
+
+1. `loadBundle` now treats bundles as hostile input: `src/bundle/validate.ts` runtime-validates every manifest/exchange/body/header/stream/failure field with typed errors; rejects non-finite/negative/out-of-range numbers, duplicate/out-of-order sequences, malformed or size-inconsistent base64, uppercase header names, unknown enum values; bounded manifest size, NDJSON line size, exchange count, and declared body sizes enforced before parsing/allocation
+2. Path containment hardened: `readContainedFile` lstat-rejects symlinks at every path component (symlinked intermediate `bodies/` dir escape closed), leaf realpath must remain under root, file size checked against declared bound before read; `writeBundle` realpaths the output root and refuses symlinked bodies dirs. 21 malicious-bundle tests added
+3. Replay never sends `__redacted__` placeholders: exchanges with capture-redacted query values fail as unreplayable unless a `queryValueProvider` (library) / `--query-env NAME:ENV` (CLI) supplies replacements. README exactness/replayability claims updated
+4. Gateway path allowlisting by path-segment semantics (`pathAllowed`): `/v1secrets` no longer matches `/v1`; encoded traversal, backslashes, control chars, malformed percent-encoding, and non-normalized methods rejected; unit + end-to-end tests
+5. PR body verification counts updated
+
+223 tests passing (was 197).
+
 ## Blockers
 
 - none

@@ -205,13 +205,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
       clientReq.resume();
       return;
     }
-    if (!policy.methods.includes(method)) {
+    // Methods are compared case-sensitively against the normalized
+    // uppercase form; a non-uppercase method is not a valid match.
+    if (method !== method.toUpperCase() || !policy.methods.includes(method)) {
       deny(clientRes, method, path, 405, `method ${method} not allowed`);
       clientReq.resume();
       return;
     }
-    const pathname = path.split('?')[0];
-    if (!policy.pathPrefixes.some((prefix) => pathname.startsWith(prefix))) {
+    if (!pathAllowed(path, policy.pathPrefixes)) {
       deny(clientRes, method, path, 403, 'path not allowed');
       clientReq.resume();
       return;
@@ -373,6 +374,45 @@ function tokenMatches(token: string, expectedSha256: string): boolean {
   const digest = createHash('sha256').update(token).digest();
   const expected = Buffer.from(expectedSha256, 'hex');
   return digest.length === expected.length && timingSafeEqual(digest, expected);
+}
+
+/**
+ * Path allowlisting by path-segment semantics. Raw startsWith would let
+ * `/v1secrets` match a `/v1` prefix and misses encoded traversal;
+ * this decodes, normalizes, and rejects hostile shapes outright.
+ */
+export function pathAllowed(rawPath: string, prefixes: readonly string[]): boolean {
+  const pathname = rawPath.split('?')[0];
+  // Reject control characters, backslashes, and null bytes before decoding.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f\\]/.test(pathname)) {
+    return false;
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false; // malformed percent-encoding
+  }
+  // Re-check after decoding: %5C, %00, %2e%2e etc.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f\\]/.test(decoded)) {
+    return false;
+  }
+  if (!decoded.startsWith('/')) {
+    return false;
+  }
+  const segments = decoded.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..')) {
+    return false;
+  }
+  return prefixes.some((prefix) => {
+    const normalized = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
+    if (normalized === '') {
+      return true; // prefix "/" allows everything
+    }
+    return decoded === normalized || decoded.startsWith(normalized + '/');
+  });
 }
 
 function extractModel(body: Buffer): string | null {

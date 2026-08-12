@@ -9,6 +9,7 @@ export {
 export {
   RedactionPolicy,
   defaultRedactionPolicy,
+  redactedQueryNames,
   REDACTED_VALUE,
   type RedactionPolicyOptions,
 } from './redaction.js';

@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import {
   startGateway,
   validatePolicy,
+  pathAllowed,
   credentialProviderFromCommand,
   type GatewayPolicy,
 } from '../../src/gateway/index.js';
@@ -293,6 +294,65 @@ describe('gateway capture integration', () => {
     // Nothing was recorded carrying the credential.
     await gateway.capture!.waitForIdle();
     expect(JSON.stringify(gateway.capture!.exchanges())).not.toContain(REAL_KEY);
+  });
+});
+
+describe('pathAllowed', () => {
+  it('matches by path segment, not raw prefix', () => {
+    expect(pathAllowed('/v1/messages', ['/v1'])).toBe(true);
+    expect(pathAllowed('/v1', ['/v1'])).toBe(true);
+    expect(pathAllowed('/v1secrets', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/messages', ['/v1/'])).toBe(true);
+    expect(pathAllowed('/v2/messages', ['/v1'])).toBe(false);
+  });
+
+  it('rejects encoded traversal', () => {
+    expect(pathAllowed('/v1/%2e%2e/admin', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/../admin', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/./x', ['/v1'])).toBe(false);
+  });
+
+  it('rejects backslashes, control characters, and malformed encoding', () => {
+    expect(pathAllowed('/v1\\admin', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/%5Cadmin', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/%00', ['/v1'])).toBe(false);
+    expect(pathAllowed('/v1/%zz', ['/v1'])).toBe(false);
+    expect(pathAllowed('relative/path', ['/v1'])).toBe(false);
+  });
+
+  it('root prefix allows everything well-formed', () => {
+    expect(pathAllowed('/anything/here', ['/'])).toBe(true);
+    expect(pathAllowed('/x/../y', ['/'])).toBe(false);
+  });
+});
+
+describe('gateway path-segment enforcement', () => {
+  it('denies prefix-collision and encoded traversal paths end to end', async () => {
+    const upstream = await startUpstream();
+    const gateway = await startTestGateway(policyFor(upstream.origin, { pathPrefixes: ['/v1'] }));
+    const headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
+
+    expect(
+      (await fetch(new URL('/v1secrets/x', gateway.url), { method: 'POST', headers, body: '{}' }))
+        .status
+    ).toBe(403);
+    expect(
+      (
+        await fetch(`${gateway.url.toString().replace(/\/$/, '')}/v1/%2e%2e/admin`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        })
+      ).status
+    ).toBe(403);
+    expect(upstream.requests).toHaveLength(0);
+
+    const ok = await fetch(new URL('/v1/messages', gateway.url), {
+      method: 'POST',
+      headers,
+      body: '{}',
+    });
+    expect(ok.status).toBe(200);
   });
 });
 

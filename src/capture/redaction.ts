@@ -82,6 +82,25 @@ export class RedactionPolicy {
 
 export const defaultRedactionPolicy = new RedactionPolicy();
 
+/**
+ * Names of query parameters whose values were redacted in a captured
+ * path+query string. The names themselves are retained in the path as
+ * evidence; this recovers them for replayability decisions.
+ */
+export function redactedQueryNames(pathWithQuery: string): string[] {
+  const queryStart = pathWithQuery.indexOf('?');
+  if (queryStart === -1) {
+    return [];
+  }
+  const names: string[] = [];
+  for (const [name, value] of new URLSearchParams(pathWithQuery.slice(queryStart + 1))) {
+    if (value === REDACTED_VALUE && !names.includes(name)) {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
 function globToRegExp(glob: string): RegExp {
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
   return new RegExp(`^${escaped}$`, 'i');
