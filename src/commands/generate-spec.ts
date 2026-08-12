@@ -36,7 +36,9 @@ export const generateSpecCommand = new Command('generate-spec')
       const pathCount = Object.keys(spec.paths).length;
       const schemaCount = Object.keys(spec.components.schemas).length;
 
-      console.info(chalk.green(`Generated spec with ${pathCount} path(s) and ${schemaCount} schema(s)`));
+      console.info(
+        chalk.green(`Generated spec with ${pathCount} path(s) and ${schemaCount} schema(s)`)
+      );
 
       const output = options.json ? specToJSON(spec) : specToYAML(spec);
 

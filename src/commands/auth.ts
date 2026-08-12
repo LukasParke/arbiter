@@ -24,25 +24,21 @@ export const authCommand = new Command('auth')
       })
   )
   .addCommand(
-    new Command('clear')
-      .description('Remove saved authentication token')
-      .action(() => {
-        const manager = new AuthManager({ type: 'plex-token', token: '' });
-        manager.saveToDisk();
-        console.info(chalk.green('Authentication token cleared'));
-      })
+    new Command('clear').description('Remove saved authentication token').action(() => {
+      const manager = new AuthManager({ type: 'plex-token', token: '' });
+      manager.saveToDisk();
+      console.info(chalk.green('Authentication token cleared'));
+    })
   )
   .addCommand(
-    new Command('show')
-      .description('Show current authentication status')
-      .action(() => {
-        const manager = new AuthManager();
-        if (manager.isAuthenticated()) {
-          console.info(chalk.green('Authenticated'));
-          console.info(chalk.gray(`  Token: ${manager.redactedToken()}`));
-        } else {
-          console.info(chalk.yellow('No authentication token configured'));
-          console.info(chalk.gray('Run: arbiter auth set --token <your-token>'));
-        }
-      })
+    new Command('show').description('Show current authentication status').action(() => {
+      const manager = new AuthManager();
+      if (manager.isAuthenticated()) {
+        console.info(chalk.green('Authenticated'));
+        console.info(chalk.gray(`  Token: ${manager.redactedToken()}`));
+      } else {
+        console.info(chalk.yellow('No authentication token configured'));
+        console.info(chalk.gray('Run: arbiter auth set --token <your-token>'));
+      }
+    })
   );

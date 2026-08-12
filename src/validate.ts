@@ -164,7 +164,7 @@ export class SpecValidator {
     if (contentType.includes('json') && body !== undefined && body !== null) {
       const media = response.content?.[contentType] || response.content?.['application/json'];
       if (media) {
-        const schema = (media).schema;
+        const schema = media.schema;
         if (schema) {
           const schemaViolations = this.validateValueAgainstSchema(body, schema, '');
           for (const v of schemaViolations) {

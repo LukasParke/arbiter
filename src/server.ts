@@ -11,6 +11,7 @@ import type { SecurityInfo } from './store/openApiStore.js';
 import { diffAgainstSpec } from './diff.js';
 import { SpecValidator } from './validate.js';
 import bodyParser from 'body-parser';
+import { defaultRedactionPolicy, REDACTED_VALUE } from './capture/redaction.js';
 
 // Create a simple HAR store
 class HARStore {
@@ -135,6 +136,10 @@ export interface ServerOptions {
   dbPath?: string;
   diffAgainst?: string;
   specValidator?: SpecValidator;
+  /** Start only the proxy listener; the docs server is not bound. */
+  proxyOnly?: boolean;
+  /** Start only the docs listener; the proxy server is not bound. */
+  docsOnly?: boolean;
 }
 
 /**
@@ -148,10 +153,15 @@ export async function startServers({
   dbPath,
   diffAgainst,
   specValidator,
+  proxyOnly = false,
+  docsOnly = false,
 }: ServerOptions): Promise<{
-  proxyServer: ReturnType<typeof createServer>;
-  docsServer: ReturnType<typeof createServer>;
+  proxyServer: ReturnType<typeof createServer> | null;
+  docsServer: ReturnType<typeof createServer> | null;
 }> {
+  if (proxyOnly && docsOnly) {
+    throw new Error('proxyOnly and docsOnly are mutually exclusive');
+  }
   // Initialize persistent storage if dbPath provided
   if (dbPath) {
     try {
@@ -339,31 +349,47 @@ export async function startServers({
                 return;
               }
 
-              // Extract query parameters
+              // Extract query parameters. Values whose names look credential-
+              // bearing are redacted before they can reach HAR, OpenAPI
+              // examples, or SQLite; benign values are kept for discovery
+              // (legacy observe semantics — exact capture redacts by default).
               const queryParams: Record<string, string> = {};
               const urlSearchParams = new URLSearchParams(originalUrl.search);
               urlSearchParams.forEach((value, key) => {
-                queryParams[key] = value;
+                queryParams[key] = defaultRedactionPolicy.isSensitiveName(key)
+                  ? REDACTED_VALUE
+                  : value;
               });
 
-              // Extract request headers
+              // Extract request headers, redacting credential values before
+              // they can reach HAR, OpenAPI examples, or SQLite.
               const requestHeaders: Record<string, string> = {};
               for (const [key, value] of Object.entries(req.headers)) {
-                if (typeof value === 'string') {
-                  requestHeaders[key] = value;
-                } else if (Array.isArray(value) && value.length > 0) {
-                  requestHeaders[key] = value[0];
-                }
+                const headerValue =
+                  typeof value === 'string'
+                    ? value
+                    : Array.isArray(value) && value.length > 0
+                      ? value[0]
+                      : undefined;
+                if (headerValue === undefined) continue;
+                requestHeaders[key] = defaultRedactionPolicy.shouldRedactHeader(key)
+                  ? REDACTED_VALUE
+                  : headerValue;
               }
 
-              // Extract response headers
+              // Extract response headers with the same redaction.
               const responseHeaders: Record<string, string> = {};
               for (const [key, value] of Object.entries(proxyRes.headers)) {
-                if (typeof value === 'string') {
-                  responseHeaders[key] = value;
-                } else if (Array.isArray(value) && value.length > 0) {
-                  responseHeaders[key] = value[0];
-                }
+                const headerValue =
+                  typeof value === 'string'
+                    ? value
+                    : Array.isArray(value) && value.length > 0
+                      ? value[0]
+                      : undefined;
+                if (headerValue === undefined) continue;
+                responseHeaders[key] = defaultRedactionPolicy.shouldRedactHeader(key)
+                  ? REDACTED_VALUE
+                  : headerValue;
               }
 
               // Get request body from our map if available
@@ -389,10 +415,7 @@ export async function startServers({
                   requestHeaders
                 );
                 for (const v of reqResult.violations) {
-                  console.warn(
-                    chalk.yellow('[VALIDATE]'),
-                    `${v.method} ${v.path}: ${v.message}`
-                  );
+                  console.warn(chalk.yellow('[VALIDATE]'), `${v.method} ${v.path}: ${v.message}`);
                 }
 
                 let responseBody: unknown = undefined;
@@ -412,10 +435,7 @@ export async function startServers({
                   responseBody
                 );
                 for (const v of respResult.violations) {
-                  console.warn(
-                    chalk.yellow('[VALIDATE]'),
-                    `${v.method} ${v.path}: ${v.message}`
-                  );
+                  console.warn(chalk.yellow('[VALIDATE]'), `${v.method} ${v.path}: ${v.message}`);
                 }
               }
 
@@ -481,22 +501,27 @@ export async function startServers({
                   .catch(() => {});
               }
 
-              // Extract security schemes from headers - minimal work
+              // Extract security schemes from the original (pre-redaction)
+              // headers - only the scheme shape is recorded, never the value.
               const securitySchemes: SecurityInfo[] = [];
-              if (requestHeaders['x-api-key']) {
+              const rawAuthorization = req.headers['authorization'];
+              const authValue = Array.isArray(rawAuthorization)
+                ? rawAuthorization[0]
+                : rawAuthorization;
+              if (req.headers['x-api-key']) {
                 securitySchemes.push({
                   type: 'apiKey' as const,
                   name: 'x-api-key',
                   in: 'header' as const,
                 });
               }
-              if (requestHeaders['authorization']?.startsWith('Bearer ')) {
+              if (authValue?.startsWith('Bearer ')) {
                 securitySchemes.push({
                   type: 'http' as const,
                   scheme: 'bearer' as const,
                 });
               }
-              if (requestHeaders['authorization']?.startsWith('Basic ')) {
+              if (authValue?.startsWith('Basic ')) {
                 securitySchemes.push({
                   type: 'http' as const,
                   scheme: 'basic' as const,
@@ -744,8 +769,8 @@ export async function startServers({
   }
 
   // Start servers
-  const availableProxyPort = await findAvailablePort(proxyPort);
-  const availableDocsPort = await findAvailablePort(docsPort);
+  const availableProxyPort = docsOnly ? proxyPort : await findAvailablePort(proxyPort);
+  const availableDocsPort = proxyOnly ? docsPort : await findAvailablePort(docsPort);
 
   if (availableProxyPort !== proxyPort) {
     console.log(
@@ -833,32 +858,41 @@ export async function startServers({
     res.send(JSON.stringify({ frames: wsFrames }));
   });
 
-  // Start servers
-  return new Promise((resolve, reject) => {
-    try {
-      proxyServer.listen(availableProxyPort, () => {
-        docsServer.listen(availableDocsPort, () => {
-          console.log('\n' + chalk.green('Arbiter is running! 🚀'));
-          console.log('\n' + chalk.bold('Proxy Server:'));
-          console.log(chalk.cyan(`  URL: http://localhost:${availableProxyPort}`));
-          console.log(chalk.gray(`  Target: ${target}`));
-          console.log('\n' + chalk.bold('Documentation:'));
-          console.log(chalk.cyan(`  API Reference: http://localhost:${availableDocsPort}/docs`));
-          console.log('\n' + chalk.bold('Exports:'));
-          console.log(chalk.cyan(`  HAR Export: http://localhost:${availableDocsPort}/har`));
-          console.log(
-            chalk.cyan(`  OpenAPI JSON: http://localhost:${availableDocsPort}/openapi.json`)
-          );
-          console.log(
-            chalk.cyan(`  OpenAPI YAML: http://localhost:${availableDocsPort}/openapi.yaml`)
-          );
-          console.log('\n' + chalk.yellow('Press Ctrl+C to stop'));
-
-          resolve({ proxyServer, docsServer });
-        });
+  // Start requested listeners only
+  const listen = (server: ReturnType<typeof createServer>, port: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, () => {
+        server.removeListener('error', reject);
+        resolve();
       });
-    } catch (error) {
-      reject(error);
-    }
-  });
+    });
+
+  if (!docsOnly) {
+    await listen(proxyServer, availableProxyPort);
+  }
+  if (!proxyOnly) {
+    await listen(docsServer, availableDocsPort);
+  }
+
+  console.log('\n' + chalk.green('Arbiter is running! 🚀'));
+  if (!docsOnly) {
+    console.log('\n' + chalk.bold('Proxy Server:'));
+    console.log(chalk.cyan(`  URL: http://localhost:${availableProxyPort}`));
+    console.log(chalk.gray(`  Target: ${target}`));
+  }
+  if (!proxyOnly) {
+    console.log('\n' + chalk.bold('Documentation:'));
+    console.log(chalk.cyan(`  API Reference: http://localhost:${availableDocsPort}/docs`));
+    console.log('\n' + chalk.bold('Exports:'));
+    console.log(chalk.cyan(`  HAR Export: http://localhost:${availableDocsPort}/har`));
+    console.log(chalk.cyan(`  OpenAPI JSON: http://localhost:${availableDocsPort}/openapi.json`));
+    console.log(chalk.cyan(`  OpenAPI YAML: http://localhost:${availableDocsPort}/openapi.yaml`));
+  }
+  console.log('\n' + chalk.yellow('Press Ctrl+C to stop'));
+
+  return {
+    proxyServer: docsOnly ? null : proxyServer,
+    docsServer: proxyOnly ? null : docsServer,
+  };
 }

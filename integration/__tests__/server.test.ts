@@ -63,8 +63,8 @@ describe('Server Integration Tests', () => {
       verbose: false,
     });
 
-    proxyServer = servers.proxyServer;
-    docsServer = servers.docsServer;
+    proxyServer = servers.proxyServer!;
+    docsServer = servers.docsServer!;
   });
 
   afterAll(async () => {

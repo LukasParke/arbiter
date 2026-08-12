@@ -116,7 +116,9 @@ export function mergeSchemas(schemas: InferredSchema[]): InferredSchema {
     }
     if (s.properties) {
       for (const [k, v] of Object.entries(s.properties)) {
-        if (!allProperties[k]) {allProperties[k] = [];}
+        if (!allProperties[k]) {
+          allProperties[k] = [];
+        }
         allProperties[k].push(v);
       }
     }
@@ -220,7 +222,9 @@ export function inferFromTraffic(trafficPath: string): EndpointSchema[] {
 
   const results: EndpointSchema[] = [];
   for (const { path, method, statusCode, contentType, bodies } of endpointMap.values()) {
-    if (bodies.length === 0) {continue;}
+    if (bodies.length === 0) {
+      continue;
+    }
 
     const schemas = bodies.map((b) => inferSchema(b));
     const merged = mergeSchemas(schemas);
@@ -271,7 +275,9 @@ function formatSchema(schema: InferredSchema, indent: string): string[] {
   const lines: string[] = [];
 
   if (schema.type) {
-    lines.push(`${indent}type: ${Array.isArray(schema.type) ? schema.type.join(', ') : schema.type}`);
+    lines.push(
+      `${indent}type: ${Array.isArray(schema.type) ? schema.type.join(', ') : schema.type}`
+    );
   }
 
   if (schema.nullable) {

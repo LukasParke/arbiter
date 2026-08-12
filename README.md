@@ -8,6 +8,10 @@ Arbiter is a powerful API proxy and documentation generator that automatically c
 
 ## Features
 
+- **Exact Capture** - Byte-fidelity capture of application HTTP bodies with deterministic, content-addressed capture bundles
+- **Replay & Comparison** - Replay captured bundles with exact-byte, semantic-JSON, or semantic-SSE comparison
+- **Redaction & Secret Safety** - Credential headers and query values are redacted before persistence; exports are secret-scanned and fail closed
+- **Credential Gateway** - Untrusted clients use short-lived opaque tokens; real upstream credentials are injected server-side and never exposed
 - **API Proxy** - Transparently proxies all API requests to the target API 
 - **Automatic OpenAPI Generation** - Builds a complete OpenAPI 3.1 specification based on observed traffic
 - **HAR Recording** - Records all requests and responses in HAR format for debugging and analysis
@@ -100,6 +104,107 @@ After using the API through the proxy, you can access:
 - OpenAPI YAML: `http://localhost:9000/openapi.yaml`
 - HAR Export: `http://localhost:9000/har`
 
+## Exact Capture and Replay
+
+Arbiter's canonical capture path guarantees **exact application HTTP body bytes after transport decoding**:
+
+- request body bytes received from the client;
+- response body bytes delivered to the client;
+- ordered SSE bytes and terminal state (`message_stop`, `[DONE]`, `response.completed`, …);
+- request method and path/query, response status, and selected end-to-end headers.
+
+Arbiter does **not** claim equality for TLS records, HTTP/2 frames, TCP segmentation, transfer-chunk framing, or provider compression framing — those are transport details, not API contract bytes. If an upstream compresses despite `Accept-Encoding: identity`, the compressed bytes are recorded canonically with their `content-encoding`, and analysis views are derived separately.
+
+### Capture
+
+```bash
+arbiter capture \
+  --target https://api.anthropic.com \
+  --output ./capture \
+  --exact \
+  --reject-secret ANTHROPIC_API_KEY \
+  --ready-file ./ready.json \
+  --report ./report.json
+```
+
+`--exact` enables fail-closed semantics: any recording, persistence, body-limit, or secret-scan failure fails the export. On shutdown (SIGINT/SIGTERM or `--idle-timeout`), a deterministic bundle is written:
+
+```text
+capture/
+  manifest.json        # version, mode, target origin, bundle digest, redaction policy
+  exchanges.ndjson     # one stable-JSON exchange per line, ordered by sequence
+  bodies/<sha256>.bin  # content-addressed body bytes
+  validation.ndjson    # optional structured violations
+```
+
+Bundles are safe to load from untrusted sources: digests are verified, symlinks and path traversal are rejected.
+
+### Replay
+
+```bash
+arbiter replay ./capture \
+  --target http://127.0.0.1:8787 \
+  --mode semantic-sse-response \
+  --credential-env OPENROUTER_API_KEY:authorization:Bearer \
+  --ignore-pointer /id \
+  --fail-on-diff
+```
+
+Modes: `status-only`, `exact-response-body` (first differing byte offset), `semantic-json-response` (first differing JSON pointer), `semantic-sse-response` (ordered events with declared volatile pointers; non-SSE exchanges fail loudly rather than matching vacuously). Replay resends the recorded method, path/query, safe headers, and exact body bytes. Redacted credentials are only re-injected through `--credential-env` or a credential-provider callback — never stored.
+
+**Redaction limits replayability by design.** A query value redacted at capture is not replayable: Arbiter never sends invented placeholder values to a target. Such exchanges fail as unreplayable unless a replacement is supplied via `--query-env NAME:ENV_VAR` (or a `queryValueProvider` callback in library use). The same applies to redacted headers and `--credential-env`. Legacy traffic JSONL replays remain available via `--legacy-jsonl` (or by passing a file path).
+
+### Sanitize and validate
+
+```bash
+arbiter sanitize ./capture --output ./sanitized --reject-secret-env ANTHROPIC_API_KEY
+arbiter validate ./capture --spec ./openapi.yaml --strict --report report.json
+```
+
+Sanitize reloads an untrusted bundle with full verification, re-applies redaction, secret-scans everything, and emits a new deterministic bundle. It never edits in place.
+
+### Credential gateway
+
+```bash
+arbiter gateway --policy policy.json --credential-command 'op read op://vault/anthropic/key' \
+  --capture-output ./gateway-capture
+```
+
+The policy pins a sha256 of an opaque client token plus expiry, target origin, methods, path prefixes, optional models, and request/byte/duration ceilings. The client never sees the upstream credential; the credential command's stdout is consumed as a secret and never logged. Oversized requests receive a clean `413` JSON response.
+
+With `--capture-output` (or `capture: {}` in library use), allowed gateway traffic is routed through an exact `CaptureSession` and exported as a deterministic bundle on shutdown. The gateway fails closed if the injected credential header is not covered by the capture redaction policy, so neither the gateway token nor the upstream credential can reach the bundle.
+
+### Library usage
+
+```typescript
+import { startCaptureSession } from '@parke.dev/arbiter/capture';
+import { loadBundle } from '@parke.dev/arbiter/bundle';
+import { replayCapture } from '@parke.dev/arbiter/replay';
+import { validateCapture, BasicOpenAPIValidator, CallbackValidator } from '@parke.dev/arbiter/validation';
+import { startGateway } from '@parke.dev/arbiter/gateway';
+
+const session = await startCaptureSession({ target: 'https://api.anthropic.com', mode: 'exact' });
+// point your client at session.url …
+await session.waitForIdle();
+const { bundle } = await session.export({ output: './capture' });
+await session.close();
+
+const report = await replayCapture(loadBundle('./capture'), {
+  target: 'http://127.0.0.1:8787',
+  mode: 'semantic-sse-response',
+  normalization: { ignorePointers: ['/id'] },
+});
+```
+
+### Security model
+
+- Default redaction removes values for `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-goog-api-key`, and any header matching `api[-_]?key|auth|credential|secret|token|cookie|session`; redacted names are kept as evidence.
+- Query parameter values are redacted by default; names are retained. Allow specific keys with `--allow-query`.
+- Exact exports secret-scan the manifest, headers, paths, and textual bodies for caller-supplied exact values (`--reject-secret ENV_NAME`) and common credential patterns (Anthropic/OpenAI/OpenRouter keys, GitHub tokens, AWS key ids, Google API keys, JWTs, PEM keys, Bearer/Basic values). Any finding fails the export; findings never contain the full secret.
+- Unexpected binary bodies fail exact export unless their media type is explicitly allowed.
+- Bundle output directories are created `0700`, files `0600`; output roots are realpath-resolved so writes never follow a symlinked directory.
+- `loadBundle` treats bundles as hostile input: every manifest/exchange field is runtime-validated with bounded sizes before allocation, sequences must be strictly increasing, base64 must be well-formed and consistent with declared sizes, digests are verified, and file reads reject symlinks at every path component under the bundle root.
+
 ## How It Works
 
 ### Proxy Server
@@ -160,7 +265,7 @@ Arbiter handles various content types:
 
 ## Middleware Usage
 
-Arbiter can also be used as middleware in your own application:
+Arbiter can also be used as middleware in your own application. Note that middleware mode observes the application *after* parsing and offers semantic capture only — proxy-level byte exactness requires `arbiter capture`:
 
 ```typescript
 import express from 'express';

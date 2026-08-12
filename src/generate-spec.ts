@@ -70,7 +70,10 @@ export function generateSpecFromTraffic(
 
     // Collect responses
     if (!group.responses.has(entry.status)) {
-      group.responses.set(entry.status, { bodies: [], contentType: entry.contentType || 'application/json' });
+      group.responses.set(entry.status, {
+        bodies: [],
+        contentType: entry.contentType || 'application/json',
+      });
     }
 
     if (entry.body && entry.contentType?.includes('json')) {
@@ -162,9 +165,7 @@ export function generateSpecFromTraffic(
       description: 'Auto-generated from captured traffic',
       version: options.version || '1.0.0',
     },
-    servers: serverUrl
-      ? [{ url: serverUrl, description: 'Target server' }]
-      : [],
+    servers: serverUrl ? [{ url: serverUrl, description: 'Target server' }] : [],
     paths,
     components: { schemas },
   };
