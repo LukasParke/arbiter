@@ -96,6 +96,13 @@ Blocking gap fixed: **gateway now composes with CaptureSession**. `GatewayOption
 
 231 tests passing (was 223).
 
+## Final state
+
+- Head 36b58a6: CI fully green (lint, build+export/CLI smoke, tests on ubuntu+macos × Node 20/22/24)
+- CodeRabbit review: APPROVED; all 15 threads addressed with fixes, replied, and resolved (0 unresolved)
+- Both parent audits (8 false-green items + gateway capture gap; 5 trust-boundary items) remediated
+- Awaiting human review/merge — agent does not merge
+
 ## Blockers
 
 - none
