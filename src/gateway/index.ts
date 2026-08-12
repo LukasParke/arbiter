@@ -125,17 +125,13 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
   };
 
   const server = http.createServer((clientReq, clientRes) => {
-    void handle(clientReq, clientRes).catch((err: unknown) => {
+    void handle(clientReq, clientRes).catch(() => {
+      // Never expose internal error detail to the untrusted client.
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'content-type': 'application/json' });
       }
       if (!clientRes.writableEnded) {
-        clientRes.end(
-          JSON.stringify({
-            error: 'gateway_error',
-            message: err instanceof Error ? err.message : 'unknown',
-          })
-        );
+        clientRes.end(JSON.stringify({ error: 'gateway_error' }));
       }
     });
   });
@@ -219,8 +215,6 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
 
     // 4. Obtain the real credential and build the upstream request. The
     // client's gateway token never leaves this process.
-    let credentialHeaders: Record<string, string> | null = await options.credentialProvider();
-
     const requestHeaders = headersFromRaw(clientReq.rawHeaders);
     delete requestHeaders['authorization'];
     const upstreamHeaders = forwardableHeaders(requestHeaders, { stripHost: true });
@@ -228,12 +222,21 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     for (const [name, values] of Object.entries(upstreamHeaders)) {
       flat[name] = values.length === 1 ? values[0] : values;
     }
-    for (const [name, value] of Object.entries(credentialHeaders)) {
-      flat[name.toLowerCase()] = value;
+    let credentialHeaders: Record<string, string> | null = null;
+    try {
+      credentialHeaders = await options.credentialProvider();
+      for (const [name, value] of Object.entries(credentialHeaders)) {
+        flat[name.toLowerCase()] = value;
+      }
+    } catch {
+      // Provider failures must not leak detail to the untrusted client.
+      deny(clientRes, method, path, 502, 'credential provider failed');
+      return;
+    } finally {
+      credentialHeaders = null; // drop the reference immediately
     }
     flat['host'] = target.host;
     flat['content-length'] = String(body.length);
-    credentialHeaders = null; // drop the reference immediately
 
     const requestFn = target.protocol === 'https:' ? https.request : http.request;
     const upstreamReq = requestFn({
@@ -253,14 +256,9 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     let upstreamRes: http.IncomingMessage;
     try {
       [upstreamRes] = (await once(upstreamReq, 'response')) as [http.IncomingMessage];
-    } catch (err) {
-      deny(
-        clientRes,
-        method,
-        path,
-        502,
-        `upstream error: ${err instanceof Error ? err.message : 'unknown'}`
-      );
+    } catch {
+      // Upstream failure details are not exposed to the untrusted client.
+      deny(clientRes, method, path, 502, 'upstream request failed');
       return;
     }
 

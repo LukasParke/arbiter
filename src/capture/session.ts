@@ -85,8 +85,11 @@ export async function startCaptureSession(options: CaptureSessionOptions): Promi
     const settled = handleExchange(clientReq, clientRes).catch((err: unknown) => {
       recordFailure({
         stage: 'response-capture',
-        message: err instanceof Error ? err.message : String(err),
+        message: err instanceof Error ? err.message : 'Exchange handling failed',
       });
+      if (!clientRes.writableEnded) {
+        clientRes.destroy();
+      }
     });
     inFlight.add(settled);
     void settled.finally(() => inFlight.delete(settled));
@@ -111,68 +114,177 @@ export async function startCaptureSession(options: CaptureSessionOptions): Promi
     let failure: CaptureFailure | null = null;
     let clientAborted = false;
 
-    const requestHeaders = headersFromRaw(clientReq.rawHeaders);
-    const upstreamHeaders = forwardableHeaders(requestHeaders, { stripHost: true });
-    if (mode === 'exact') {
-      // Ask for undecoded bytes so canonical capture equals the application
-      // body. Upstreams may still compress; that is recorded as-is.
-      upstreamHeaders['accept-encoding'] = ['identity'];
+    try {
+      await runExchange();
+    } catch (err) {
+      // Ensure spill files never leak when an exchange dies unexpectedly.
+      // abort() is a no-op once finish() has transferred ownership.
+      requestSink.abort();
+      responseSink.abort();
+      throw err;
     }
+    return;
 
-    const upstreamReq = requestFn({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      method,
-      path: rawPath,
-      headers: flattenHeaders({ ...upstreamHeaders, host: [target.host] }),
-      rejectUnauthorized: options.rejectUnauthorized ?? true,
-    } as https.RequestOptions);
+    async function runExchange(): Promise<void> {
+      const requestHeaders = headersFromRaw(clientReq.rawHeaders);
+      const upstreamHeaders = forwardableHeaders(requestHeaders, { stripHost: true });
+      if (mode === 'exact') {
+        // Ask for undecoded bytes so canonical capture equals the application
+        // body. Upstreams may still compress; that is recorded as-is.
+        upstreamHeaders['accept-encoding'] = ['identity'];
+      }
 
-    clientReq.on('data', (chunk: Buffer) => {
-      try {
-        requestSink.write(chunk);
-      } catch (err) {
-        failure = {
-          stage: 'request-capture',
-          message: err instanceof BodyLimitExceededError ? err.message : String(err),
-        };
-        clientReq.destroy();
+      const upstreamReq = requestFn({
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        method,
+        path: rawPath,
+        headers: flattenHeaders({ ...upstreamHeaders, host: [target.host] }),
+        rejectUnauthorized: options.rejectUnauthorized ?? true,
+      } as https.RequestOptions);
+
+      clientReq.on('data', (chunk: Buffer) => {
+        try {
+          requestSink.write(chunk);
+        } catch (err) {
+          // Never propagate raw error strings that could embed body bytes.
+          failure = {
+            stage: 'request-capture',
+            message:
+              err instanceof BodyLimitExceededError ? err.message : 'Request capture sink failed',
+          };
+          clientReq.destroy();
+          upstreamReq.destroy();
+          return;
+        }
+        const ok = upstreamReq.write(chunk);
+        if (!ok) {
+          clientReq.pause();
+          upstreamReq.once('drain', () => clientReq.resume());
+        }
+      });
+      clientReq.on('end', () => upstreamReq.end());
+      clientReq.on('aborted', () => {
+        clientAborted = true;
         upstreamReq.destroy();
+      });
+      clientReq.on('error', () => {
+        clientAborted = true;
+        upstreamReq.destroy();
+      });
+
+      let upstreamRes: http.IncomingMessage;
+      try {
+        [upstreamRes] = (await once(upstreamReq, 'response')) as [http.IncomingMessage];
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!clientAborted) {
+          failure = failure ?? { stage: 'upstream-connect', message };
+          if (!clientRes.headersSent) {
+            clientRes.writeHead(502, { 'content-type': 'application/json' });
+          }
+          if (!clientRes.writableEnded) {
+            // Client gets a generic error; details stay in the capture failure.
+            clientRes.end(JSON.stringify({ error: 'Bad gateway' }));
+          }
+        }
+        const requestDone = requestSink.finish();
+        const responseDone = responseSink.finish();
+        finalizeExchange({
+          seq,
+          startedAtIso,
+          exchangeStart,
+          method,
+          rawPath,
+          clientReq,
+          requestHeaders,
+          requestDone,
+          responseDone,
+          status: 502,
+          statusText: 'Bad Gateway',
+          responseHttpVersion: '1.1',
+          responseHeaders: {},
+          stream: {
+            kind: 'buffered',
+            completed: false,
+            clientAborted,
+            upstreamAborted: true,
+            terminalMarker: null,
+            error: message,
+          },
+          failure: failure ?? { stage: 'upstream-connect', message },
+        });
         return;
       }
-      const ok = upstreamReq.write(chunk);
-      if (!ok) {
-        clientReq.pause();
-        upstreamReq.once('drain', () => clientReq.resume());
-      }
-    });
-    clientReq.on('end', () => upstreamReq.end());
-    clientReq.on('aborted', () => {
-      clientAborted = true;
-      upstreamReq.destroy();
-    });
-    clientReq.on('error', () => {
-      clientAborted = true;
-      upstreamReq.destroy();
-    });
 
-    let upstreamRes: http.IncomingMessage;
-    try {
-      [upstreamRes] = (await once(upstreamReq, 'response')) as [http.IncomingMessage];
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!clientAborted) {
-        failure = failure ?? { stage: 'upstream-connect', message };
-        if (!clientRes.headersSent) {
-          clientRes.writeHead(502, { 'content-type': 'application/json' });
+      const responseHeaders = headersFromRaw(upstreamRes.rawHeaders);
+      const mediaType = firstHeader(responseHeaders, 'content-type');
+      const isSse = mediaType !== null && mediaType.toLowerCase().includes('text/event-stream');
+      const sseParser = isSse ? new SseParser() : null;
+
+      const clientHeaders = forwardableHeaders(responseHeaders);
+      clientRes.writeHead(
+        upstreamRes.statusCode ?? 200,
+        upstreamRes.statusMessage ?? '',
+        flattenHeaders(clientHeaders)
+      );
+      clientRes.flushHeaders();
+
+      let upstreamAborted = false;
+      let completed = false;
+      let streamError: string | null = null;
+
+      upstreamRes.on('data', (chunk: Buffer) => {
+        try {
+          responseSink.write(chunk);
+          sseParser?.feed(chunk);
+        } catch (err) {
+          failure = failure ?? {
+            stage: 'response-capture',
+            message:
+              err instanceof BodyLimitExceededError ? err.message : 'Response capture sink failed',
+          };
+          upstreamRes.destroy();
+          return;
         }
         if (!clientRes.writableEnded) {
-          clientRes.end(JSON.stringify({ error: 'Bad gateway', message }));
+          const ok = clientRes.write(chunk);
+          if (!ok) {
+            upstreamRes.pause();
+            clientRes.once('drain', () => upstreamRes.resume());
+          }
         }
+      });
+
+      clientRes.on('close', () => {
+        if (!clientRes.writableEnded) {
+          clientAborted = true;
+          upstreamRes.destroy();
+        }
+      });
+
+      await new Promise<void>((resolve) => {
+        upstreamRes.on('end', () => {
+          completed = true;
+          resolve();
+        });
+        upstreamRes.on('error', (err) => {
+          upstreamAborted = true;
+          streamError = err.message;
+          resolve();
+        });
+        upstreamRes.on('close', () => resolve());
+      });
+
+      sseParser?.end();
+      if (!clientRes.writableEnded) {
+        clientRes.end();
       }
+
       const requestDone = requestSink.finish();
       const responseDone = responseSink.finish();
+
       finalizeExchange({
         seq,
         startedAtIso,
@@ -183,113 +295,21 @@ export async function startCaptureSession(options: CaptureSessionOptions): Promi
         requestHeaders,
         requestDone,
         responseDone,
-        status: 502,
-        statusText: 'Bad Gateway',
-        responseHttpVersion: '1.1',
-        responseHeaders: {},
+        status: upstreamRes.statusCode ?? 0,
+        statusText: upstreamRes.statusMessage ?? '',
+        responseHttpVersion: upstreamRes.httpVersion,
+        responseHeaders,
         stream: {
-          kind: 'buffered',
-          completed: false,
+          kind: isSse ? 'sse' : 'buffered',
+          completed: completed && !clientAborted,
           clientAborted,
-          upstreamAborted: true,
-          terminalMarker: null,
-          error: message,
+          upstreamAborted,
+          terminalMarker: sseParser?.terminalMarker ?? null,
+          error: streamError,
         },
-        failure: failure ?? { stage: 'upstream-connect', message },
+        failure,
       });
-      return;
     }
-
-    const responseHeaders = headersFromRaw(upstreamRes.rawHeaders);
-    const mediaType = firstHeader(responseHeaders, 'content-type');
-    const isSse = mediaType !== null && mediaType.toLowerCase().includes('text/event-stream');
-    const sseParser = isSse ? new SseParser() : null;
-
-    const clientHeaders = forwardableHeaders(responseHeaders);
-    clientRes.writeHead(
-      upstreamRes.statusCode ?? 200,
-      upstreamRes.statusMessage ?? '',
-      flattenHeaders(clientHeaders)
-    );
-    clientRes.flushHeaders();
-
-    let upstreamAborted = false;
-    let completed = false;
-    let streamError: string | null = null;
-
-    upstreamRes.on('data', (chunk: Buffer) => {
-      try {
-        responseSink.write(chunk);
-        sseParser?.feed(chunk);
-      } catch (err) {
-        failure = failure ?? {
-          stage: 'response-capture',
-          message: err instanceof Error ? err.message : String(err),
-        };
-        upstreamRes.destroy();
-        return;
-      }
-      if (!clientRes.writableEnded) {
-        const ok = clientRes.write(chunk);
-        if (!ok) {
-          upstreamRes.pause();
-          clientRes.once('drain', () => upstreamRes.resume());
-        }
-      }
-    });
-
-    clientRes.on('close', () => {
-      if (!clientRes.writableEnded) {
-        clientAborted = true;
-        upstreamRes.destroy();
-      }
-    });
-
-    await new Promise<void>((resolve) => {
-      upstreamRes.on('end', () => {
-        completed = true;
-        resolve();
-      });
-      upstreamRes.on('error', (err) => {
-        upstreamAborted = true;
-        streamError = err.message;
-        resolve();
-      });
-      upstreamRes.on('close', () => resolve());
-    });
-
-    sseParser?.end();
-    if (!clientRes.writableEnded) {
-      clientRes.end();
-    }
-
-    const requestDone = requestSink.finish();
-    const responseDone = responseSink.finish();
-
-    finalizeExchange({
-      seq,
-      startedAtIso,
-      exchangeStart,
-      method,
-      rawPath,
-      clientReq,
-      requestHeaders,
-      requestDone,
-      responseDone,
-      status: upstreamRes.statusCode ?? 0,
-      statusText: upstreamRes.statusMessage ?? '',
-      responseHttpVersion: upstreamRes.httpVersion,
-      responseHeaders,
-      stream: {
-        kind: isSse ? 'sse' : 'buffered',
-        completed: completed && !clientAborted,
-        clientAborted,
-        upstreamAborted,
-        terminalMarker: sseParser?.terminalMarker ?? null,
-        error: streamError,
-      },
-      failure,
-    });
   }
 
   interface FinalizeArgs {

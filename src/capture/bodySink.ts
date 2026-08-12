@@ -97,6 +97,9 @@ export class BodySink {
   }
 
   abort(): void {
+    if (this.finished) {
+      return; // finish() already transferred ownership of the bytes
+    }
     this.finished = true;
     if (this.spillFd !== null) {
       fs.closeSync(this.spillFd);
