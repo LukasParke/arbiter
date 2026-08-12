@@ -63,10 +63,11 @@ jobs:
       - name: Publish to npm
         if: steps.check.outputs.should_publish == 'true'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          # Enable provenance for npm (requires id-token permission)
-          npm publish --provenance --access public
+          # setup-node writes an .npmrc that interpolates NODE_AUTH_TOKEN.
+          # A stale classic token 404s the scoped PUT and shadows OIDC.
+          # Empty string lets npm use trusted publishing (id-token: write).
+          NODE_AUTH_TOKEN: ""
+        run: npm publish --provenance --access public
 
       - name: Skip publish (version unchanged)
         if: steps.check.outputs.should_publish != 'true'
