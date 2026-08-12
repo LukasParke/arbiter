@@ -3,7 +3,7 @@
 Branch: `agent/exact-capture` (worktree `/Users/luke/.herdr/worktrees/arbiter/agent-exact-capture`)
 Plan: `PLAN.md`
 Tracking issue: https://github.com/LukasParke/arbiter/issues/32
-PR: (pending)
+PR: https://github.com/LukasParke/arbiter/pull/33
 
 ## Phase status
 
@@ -43,6 +43,12 @@ PR: (pending)
   - integration: byte fidelity (JSON whitespace/binary), SSE live-streaming before upstream completion, upstream abort metadata, identity encoding, compressed canonical bytes, duplicate headers, redaction e2e, fail-closed export, spill, secret rejection, 502 failure, HAR/JSONL derivation + base64 round-trip, replay (bytes/headers/credentials/diffs), gateway policy suite, provider-shaped golden fixtures, proxy-only/docs-only binding
   - CLI smoke: capture → sanitize → replay end-to-end via dist/cli.js, secret-rejection exit codes
 - package export smoke: all five new subpath exports load from dist
+
+## Post-PR
+
+- Clean-context security review run; C1–C5/H2/H3 hardened (generic client-facing errors, spill cleanup on abnormal death, credential ref dropped in finally) — commit e065bc1
+- CI workflow was broken repo-wide (pnpm 11 via version:latest needs Node >= 22.13; every matrix job failed at install). Fixed: pnpm pinned to 10, lint once on Node 22, new build job with export/CLI smoke, tests on ubuntu+macos × Node 20/22/24 — commit 1f15767
+- Monitoring CI + reviews via sentinel `arbiter-pr33-ci`
 
 ## Blockers
 
