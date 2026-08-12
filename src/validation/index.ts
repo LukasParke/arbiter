@@ -193,6 +193,9 @@ export class CommandValidator implements ContractValidator {
           reject(err instanceof Error ? err : new Error(String(err)));
         }
       });
+      // A validator that exits before reading stdin causes EPIPE; the close
+      // handler already reports the failure, so swallow the write error.
+      child.stdin.on('error', () => undefined);
       child.stdin.end(JSON.stringify({ exchange, direction, bodyBase64: body.toString('base64') }));
     });
   }
