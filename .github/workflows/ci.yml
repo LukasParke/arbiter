@@ -32,7 +32,7 @@ jobs:
         run: pnpm run format:check
 
       - name: Run linter
-        run: pnpm run lint -- --max-warnings 0
+        run: pnpm run lint --max-warnings 0
 
   build:
     name: Build and Typecheck
