@@ -67,7 +67,9 @@ jobs:
           # A stale classic token 404s the scoped PUT and shadows OIDC.
           # Empty string lets npm use trusted publishing (id-token: write).
           NODE_AUTH_TOKEN: ""
-        run: npm publish --provenance --access public
+        run: |
+          # Node 22.x ships npm 10.9; trusted publishing needs >= 11.5.1
+          npx -y npm@latest publish --provenance --access public
 
       - name: Skip publish (version unchanged)
         if: steps.check.outputs.should_publish != 'true'
