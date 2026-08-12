@@ -102,6 +102,21 @@ describe('compareSemanticSse', () => {
     expect(result.match).toBe(false);
     expect(result.firstDiffEvent?.reason).toContain('event count');
   });
+
+  it('rejects bodies with no parseable SSE events instead of matching vacuously', () => {
+    const empty = Buffer.from('');
+    const json = Buffer.from('{"ok":true}');
+    expect(compareSemanticSse(empty, empty).match).toBe(false);
+    expect(compareSemanticSse(empty, empty).detail).toMatch(/no parseable SSE events/);
+    expect(compareSemanticSse(json, json).match).toBe(false);
+  });
+
+  it('rejects when only the actual body is non-SSE', () => {
+    const sse = stream(['data: {"n":1}']);
+    const result = compareSemanticSse(sse, Buffer.from(''));
+    expect(result.match).toBe(false);
+    expect(result.detail).toMatch(/Actual body/);
+  });
 });
 
 describe('firstJsonDiff', () => {

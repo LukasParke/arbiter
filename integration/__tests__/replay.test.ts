@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { once } from 'events';
-import { startCaptureSession } from '../../src/capture/index.js';
+import { startCaptureSession, RedactionPolicy } from '../../src/capture/index.js';
 import { loadBundle, type CaptureBundle } from '../../src/bundle/index.js';
 import { replayCapture, credentialProviderFromEnvMappings } from '../../src/replay/index.js';
 
@@ -96,10 +96,44 @@ describe('replayCapture', () => {
     const sent = replayTarget.requests[0];
     expect(sent.body.toString('utf-8')).toBe(oddBody);
     expect(sent.method).toBe('POST');
+    // Path and query names replay exactly; the query VALUE was redacted at
+    // capture per policy, so the redaction placeholder is what replays.
+    const recordedPath = bundle.exchanges[0].request.path;
+    expect(sent.url).toBe(recordedPath);
+    expect(sent.url.split('?')[0]).toBe('/v1/messages');
+    expect(sent.url).toContain('page=');
     expect(sent.headers['x-request-tag']).toBe('replay-me');
     expect(sent.headers['content-type']).toBe('application/json');
     // Redacted credential is NOT replayed
     expect(sent.headers.authorization).toBeUndefined();
+  });
+
+  it('replays an allowed query value exactly as captured', async () => {
+    const original = await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const session = await startCaptureSession({
+      target: original.url,
+      mode: 'exact',
+      redaction: new RedactionPolicy({ allowQuery: ['page', 'limit'] }),
+    });
+    await (await fetch(new URL('/v1/items?page=7&limit=25', session.url))).arrayBuffer();
+    await session.waitForIdle();
+    const out = tmpdir();
+    const { bundle } = await session.export({ output: path.join(out, 'capture') });
+    await session.close();
+
+    const replayTarget = await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const report = await replayCapture(bundle, { target: replayTarget.url, mode: 'status-only' });
+    expect(report.summary.passed).toBe(1);
+    const sentUrl = new URL(replayTarget.requests[0].url, replayTarget.url);
+    expect(sentUrl.pathname).toBe('/v1/items');
+    expect(sentUrl.searchParams.get('page')).toBe('7');
+    expect(sentUrl.searchParams.get('limit')).toBe('25');
   });
 
   it('injects credentials through a provider without touching the bundle', async () => {
@@ -126,6 +160,49 @@ describe('replayCapture', () => {
     expect(JSON.stringify(bundle.exchanges.map((e) => e.request.headers))).not.toContain(
       'sk-injected'
     );
+  });
+
+  it('captures with a redacted credential, then replays with a reinjected one, end to end', async () => {
+    const ORIGINAL_KEY = 'sk-original-provider-key-123';
+    const REPLAY_KEY = 'sk-replay-injected-key-456';
+
+    // 1. Capture: client sends the original credential; upstream sees it.
+    const original = await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const bundle = await captureOne(original.url, async (proxyUrl) => {
+      await (
+        await fetch(new URL('/v1/messages', proxyUrl), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': ORIGINAL_KEY },
+          body: '{"model":"m"}',
+        })
+      ).arrayBuffer();
+    });
+    expect(original.requests[0].headers['x-api-key']).toBe(ORIGINAL_KEY);
+
+    // 2. The exported bundle holds neither key, only redaction evidence.
+    const bundleJson = JSON.stringify(bundle.exchanges);
+    expect(bundleJson).not.toContain(ORIGINAL_KEY);
+    expect(bundle.exchanges[0].request.headers.redacted).toContain('x-api-key');
+
+    // 3. Replay with a different injected credential: the target receives
+    //    exactly the reinjected key, the body bytes, and never the original.
+    const replayTarget = await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const report = await replayCapture(bundle, {
+      target: replayTarget.url,
+      mode: 'semantic-json-response',
+      credentialProvider: () => ({ 'x-api-key': REPLAY_KEY }),
+    });
+    expect(report.summary.passed).toBe(1);
+    const sent = replayTarget.requests[0];
+    expect(sent.headers['x-api-key']).toBe(REPLAY_KEY);
+    expect(JSON.stringify(sent.headers)).not.toContain(ORIGINAL_KEY);
+    expect(sent.body.toString('utf-8')).toBe('{"model":"m"}');
   });
 
   it('supports env-mapping credential providers', async () => {

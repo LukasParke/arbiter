@@ -52,6 +52,23 @@ PR: https://github.com/LukasParke/arbiter/pull/33
 - CommandValidator stdin EPIPE race fixed (Linux CI caught it; validator exiting before reading stdin)
 - CodeRabbit rate-limited; retriggering when the limit resets, then driving threads to zero
 
+## Parent-review remediation (post-PR)
+
+All 8 false-green/high items plus the gateway capture gap addressed:
+
+1. semantic-sse mode rejects non-SSE/empty bodies (`compareSemanticSse`) and replay marks non-SSE exchanges as failures instead of vacuous passes; provider fixture asserts 3 pass / 2 loud failures
+2. upstream destroy AND bare socket close both set `upstreamAborted: true` + error evidence (new `close`-without-`end` handling in session); two truncation tests
+3. exported request bytes asserted byte-exact in bundle round-trip + provider fixture
+4. replay path/query asserted exact, including an allowed-query (`page=7&limit=25`) exact-value test
+5. end-to-end test: capture with redacted `x-api-key` → bundle holds neither key → replay reinjects a different key, target receives only the new one
+6. determinism test compares content-addressed `bodies/*.bin` names and bytes across two writes
+7. secret-free export test walks every bundle file plus derived HAR/JSONL for four planted secrets (auth header, query value, client cookie, set-cookie)
+8. gateway oversized requests: clean `413` JSON + `connection: close`, no socket destroy; gateway stays usable afterwards
+
+Blocking gap fixed: **gateway now composes with CaptureSession**. `GatewayOptions.capture` routes upstream traffic through an exact capture session (`GatewayServer.capture` exposes it; CLI `--capture-output` exports on shutdown). Fails closed if the injected credential header is not covered by the capture redaction policy. Tests prove byte-exact client traffic recorded with neither the gateway token nor the real credential in any artifact.
+
+197 tests passing (was 189).
+
 ## Blockers
 
 - none

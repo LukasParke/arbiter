@@ -15,6 +15,7 @@ interface GatewayCliOptions {
   port: string;
   host: string;
   readyFile?: string;
+  captureOutput?: string;
 }
 
 export const gatewayCommand = new Command('gateway')
@@ -29,6 +30,10 @@ export const gatewayCommand = new Command('gateway')
   .option('-p, --port <number>', 'port to listen on (0 = random)', '0')
   .option('--host <hostname>', 'hostname to bind', '127.0.0.1')
   .option('--ready-file <path>', 'write listener metadata JSON atomically once ready')
+  .option(
+    '--capture-output <dir>',
+    'record allowed gateway traffic and export an exact capture bundle on shutdown'
+  )
   .action(async (options: GatewayCliOptions) => {
     let policy: GatewayPolicy;
     try {
@@ -46,6 +51,7 @@ export const gatewayCommand = new Command('gateway')
         options.credentialPrefix !== undefined ? { prefix: options.credentialPrefix } : {}
       ),
       listen: { hostname: options.host, port: parseInt(options.port, 10) },
+      ...(options.captureOutput ? { capture: {} } : {}),
       onRequest: (event) => {
         const mark = event.allowed ? chalk.green('✓') : chalk.red('✗');
         console.info(
@@ -75,8 +81,35 @@ export const gatewayCommand = new Command('gateway')
       fs.renameSync(tmp, options.readyFile);
     }
 
+    let shuttingDown = false;
     const shutdown = (): void => {
-      void gateway.close().then(() => process.exit(0));
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      void (async (): Promise<void> => {
+        let exitCode = 0;
+        try {
+          if (options.captureOutput && gateway.capture) {
+            await gateway.capture.waitForIdle();
+            const { manifest } = await gateway.capture.export({ output: options.captureOutput });
+            console.info(
+              chalk.green(
+                `Exported ${manifest.exchangeCount} exchange(s) to ${options.captureOutput}`
+              )
+            );
+          }
+        } catch (err) {
+          console.error(
+            chalk.red('Capture export failed:'),
+            err instanceof Error ? err.message : err
+          );
+          exitCode = 1;
+        } finally {
+          await gateway.close();
+          process.exit(exitCode);
+        }
+      })();
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);

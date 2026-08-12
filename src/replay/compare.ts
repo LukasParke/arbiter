@@ -86,8 +86,18 @@ export function compareSemanticSse(
   const filter = normalization.eventFilter ? new Set(normalization.eventFilter) : null;
   const keep = (e: { event: string | null }): boolean =>
     filter === null || (e.event !== null && filter.has(e.event));
-  const expectedEvents = parseSseBody(expected).filter(keep);
-  const actualEvents = parseSseBody(actual).filter(keep);
+  const allExpected = parseSseBody(expected);
+  if (allExpected.length === 0) {
+    // A body that yields no SSE events is not comparable in SSE mode;
+    // matching it vacuously would be a false green.
+    return { match: false, detail: 'Expected body contains no parseable SSE events' };
+  }
+  const allActual = parseSseBody(actual);
+  if (allActual.length === 0) {
+    return { match: false, detail: 'Actual body contains no parseable SSE events' };
+  }
+  const expectedEvents = allExpected.filter(keep);
+  const actualEvents = allActual.filter(keep);
   const ignore = new Set(normalization.ignorePointers ?? []);
 
   const limit = Math.min(expectedEvents.length, actualEvents.length);

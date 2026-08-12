@@ -158,20 +158,28 @@ describe('gateway policy enforcement', () => {
     expect(res.status).toBe(403);
   });
 
-  it('enforces request byte ceilings', async () => {
+  it('rejects oversized requests with a clean 413 response', async () => {
     const upstream = await startUpstream();
     const gateway = await startTestGateway(policyFor(upstream.origin, { maxRequestBytes: 16 }));
-    try {
-      const res = await fetch(new URL('/v1/m', gateway.url), {
-        method: 'POST',
-        headers: { authorization: `Bearer ${TOKEN}` },
-        body: 'x'.repeat(64),
-      });
-      expect([413, 0]).toContain(res.status);
-    } catch {
-      // socket destroyed mid-body is also acceptable fail-closed behavior
-    }
+    const res = await fetch(new URL('/v1/m', gateway.url), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}` },
+      body: 'x'.repeat(64),
+    });
+    // The contract: a readable 413 JSON response, never a destroyed socket.
+    expect(res.status).toBe(413);
+    const parsed = (await res.json()) as { error: string; reason: string };
+    expect(parsed.error).toBe('gateway_denied');
+    expect(parsed.reason).toMatch(/byte limit/);
     expect(upstream.requests).toHaveLength(0);
+
+    // The gateway remains usable for subsequent (new-connection) requests.
+    const ok = await fetch(new URL('/v1/m', gateway.url), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(ok.status).toBe(200);
   });
 
   it('enforces model restrictions on JSON bodies', async () => {
@@ -209,6 +217,82 @@ describe('gateway policy enforcement', () => {
     const serialized = JSON.stringify(events);
     expect(serialized).not.toContain(REAL_KEY);
     expect(serialized).not.toContain(TOKEN);
+  });
+});
+
+describe('gateway capture integration', () => {
+  it('records client traffic through an exact capture session without the real credential', async () => {
+    const upstream = await startUpstream();
+    const events: unknown[] = [];
+    const gateway = await startGateway({
+      policy: policyFor(upstream.origin),
+      credentialProvider: () => Promise.resolve({ 'x-api-key': REAL_KEY }),
+      capture: {},
+      onRequest: (e) => events.push(e),
+    });
+    cleanups.push(() => gateway.close());
+
+    const body = '{ "model":  "claude" , "input": "hi"}';
+    const res = await fetch(new URL('/v1/messages?trace=x', gateway.url), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body,
+    });
+    expect(res.status).toBe(200);
+    await res.arrayBuffer();
+
+    // Upstream still received the real key through the capture proxy.
+    expect(upstream.requests[0].headers['x-api-key']).toBe(REAL_KEY);
+    expect(upstream.requests[0].body.toString('utf-8')).toBe(body);
+
+    // The capture session recorded the exchange byte-exactly.
+    expect(gateway.capture).not.toBeNull();
+    await gateway.capture!.waitForIdle();
+    const exchanges = gateway.capture!.exchanges();
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].request.method).toBe('POST');
+    expect(exchanges[0].request.path.split('?')[0]).toBe('/v1/messages');
+
+    // Export the bundle and prove neither secret is anywhere in it.
+    const os = await import('os');
+    const fs = await import('fs');
+    const path = await import('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arbiter-gwcap-'));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const { bundle } = await gateway.capture!.export({ output: path.join(dir, 'capture') });
+
+    expect(bundle.readBody(bundle.exchanges[0].request.body).toString('utf-8')).toBe(body);
+    const everything =
+      JSON.stringify(bundle.exchanges) +
+      fs.readFileSync(path.join(dir, 'capture', 'exchanges.ndjson'), 'utf-8') +
+      fs.readFileSync(path.join(dir, 'capture', 'manifest.json'), 'utf-8');
+    expect(everything).not.toContain(REAL_KEY);
+    expect(everything).not.toContain(TOKEN);
+    expect(bundle.exchanges[0].request.headers.redacted).toContain('x-api-key');
+  });
+
+  it('fails closed when the credential header is not covered by capture redaction', async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({
+      policy: policyFor(upstream.origin),
+      // 'x-upstream-cred' does not match the default redaction policy, so
+      // forwarding it through the recording path must be refused.
+      credentialProvider: () => Promise.resolve({ 'x-upstream-cred': REAL_KEY }),
+      capture: {},
+    });
+    cleanups.push(() => gateway.close());
+
+    const res = await fetch(new URL('/v1/m', gateway.url), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(502);
+    expect(upstream.requests).toHaveLength(0);
+
+    // Nothing was recorded carrying the credential.
+    await gateway.capture!.waitForIdle();
+    expect(JSON.stringify(gateway.capture!.exchanges())).not.toContain(REAL_KEY);
   });
 });
 

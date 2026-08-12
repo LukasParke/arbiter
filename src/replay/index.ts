@@ -215,8 +215,17 @@ async function replayExchange(
 
     let comparison: ComparisonResult | null = null;
     if (options.mode !== 'status-only') {
-      const expected = bundle.readBody(exchange.response.body);
-      comparison = runComparison(options.mode, expected, responseBytes, options);
+      if (options.mode === 'semantic-sse-response' && exchange.response.stream.kind !== 'sse') {
+        // Applying SSE comparison to a non-SSE exchange must be a visible
+        // failure, never a vacuous pass.
+        comparison = {
+          match: false,
+          detail: `Recorded exchange is not SSE (stream kind: ${exchange.response.stream.kind}); semantic-sse-response does not apply`,
+        };
+      } else {
+        const expected = bundle.readBody(exchange.response.body);
+        comparison = runComparison(options.mode, expected, responseBytes, options);
+      }
     }
 
     return {

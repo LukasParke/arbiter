@@ -14,6 +14,9 @@ import http from 'http';
 import https from 'https';
 import { once } from 'events';
 import { headersFromRaw, forwardableHeaders } from '../capture/headers.js';
+import { startCaptureSession, type CaptureSession } from '../capture/session.js';
+import { defaultRedactionPolicy, type RedactionPolicy } from '../capture/redaction.js';
+import type { CaptureMode } from '../capture/types.js';
 
 export interface GatewayPolicy {
   /** sha256 hex of the opaque gateway token. The token itself is never stored. */
@@ -35,10 +38,24 @@ export interface GatewayPolicy {
 /** Returns the upstream credential header map. Output is treated as secret. */
 export type GatewayCredentialProvider = () => Promise<Record<string, string>>;
 
+export interface GatewayCaptureOptions {
+  /** Capture semantics for gateway traffic. Default 'exact'. */
+  mode?: CaptureMode;
+  redaction?: RedactionPolicy;
+  maxBodyBytes?: number;
+}
+
 export interface GatewayOptions {
   policy: GatewayPolicy;
   credentialProvider: GatewayCredentialProvider;
   listen?: { hostname?: string; port?: number };
+  /**
+   * Record allowed gateway traffic through an exact CaptureSession. The
+   * session sits between the gateway and the upstream, so recorded exchanges
+   * carry the client's byte-exact bodies with credential headers redacted;
+   * neither the gateway token nor the upstream credential reaches the bundle.
+   */
+  capture?: GatewayCaptureOptions;
   /** Called for each decision; requests are observable, secrets are not. */
   onRequest?: (event: GatewayRequestEvent) => void;
   rejectUnauthorized?: boolean;
@@ -56,6 +73,8 @@ export interface GatewayServer {
   readonly url: URL;
   /** Requests served so far (allowed only). */
   readonly requestCount: number;
+  /** The recording session when options.capture was set; otherwise null. */
+  readonly capture: CaptureSession | null;
   close(): Promise<void>;
 }
 
@@ -98,9 +117,27 @@ export function validatePolicy(policy: GatewayPolicy): void {
 export async function startGateway(options: GatewayOptions): Promise<GatewayServer> {
   validatePolicy(options.policy);
   const policy = options.policy;
-  const target = new URL(policy.targetOrigin);
   const startedAt = Date.now();
   let served = 0;
+
+  // When capture is enabled the gateway routes upstream requests through an
+  // exact CaptureSession pointed at the policy target. Recorded exchanges
+  // carry the client's byte-exact bodies; the gateway token is stripped
+  // before forwarding and the injected credential header is redacted by the
+  // session's policy, so neither reaches the bundle.
+  const captureSession: CaptureSession | null = options.capture
+    ? await startCaptureSession({
+        target: policy.targetOrigin,
+        mode: options.capture.mode ?? 'exact',
+        ...(options.capture.redaction ? { redaction: options.capture.redaction } : {}),
+        ...(options.capture.maxBodyBytes !== undefined
+          ? { maxBodyBytes: options.capture.maxBodyBytes }
+          : {}),
+        rejectUnauthorized: options.rejectUnauthorized ?? true,
+      })
+    : null;
+  const upstreamUrl = captureSession ? captureSession.url : new URL(policy.targetOrigin);
+  const captureRedaction = options.capture?.redaction ?? defaultRedactionPolicy;
 
   const emit = (event: GatewayRequestEvent): void => {
     try {
@@ -182,28 +219,29 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
 
     // 3. Buffer the request body under the byte ceiling (needed for the
     // model check, and gateway requests are bounded by policy anyway).
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let overLimit = false;
-    clientReq.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > policy.maxRequestBytes) {
-        overLimit = true;
-        clientReq.destroy();
-        return;
-      }
-      chunks.push(chunk);
+    // Crossing the ceiling yields a clean 413 response; the socket is not
+    // destroyed before the response, and `connection: close` lets Node tear
+    // the connection down after the response flushes.
+    const body = await new Promise<Buffer | null>((resolve) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      clientReq.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > policy.maxRequestBytes) {
+          clientReq.pause();
+          resolve(null);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      clientReq.on('end', () => resolve(Buffer.concat(chunks)));
+      clientReq.on('error', () => resolve(null));
     });
-    try {
-      await once(clientReq, 'end');
-    } catch {
-      /* destroyed below-limit handling */
-    }
-    if (overLimit) {
+    if (body === null) {
+      clientRes.setHeader('connection', 'close');
       deny(clientRes, method, path, 413, 'request byte limit exceeded');
       return;
     }
-    const body = Buffer.concat(chunks);
 
     if (policy.models && policy.models.length > 0) {
       const model = extractModel(body);
@@ -225,6 +263,15 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     let credentialHeaders: Record<string, string> | null = null;
     try {
       credentialHeaders = await options.credentialProvider();
+      if (captureSession) {
+        // Fail closed: a credential header the capture policy would persist
+        // must never be forwarded through the recording path.
+        for (const name of Object.keys(credentialHeaders)) {
+          if (!captureRedaction.shouldRedactHeader(name)) {
+            throw new Error('credential header not covered by capture redaction policy');
+          }
+        }
+      }
       for (const [name, value] of Object.entries(credentialHeaders)) {
         flat[name.toLowerCase()] = value;
       }
@@ -235,14 +282,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     } finally {
       credentialHeaders = null; // drop the reference immediately
     }
-    flat['host'] = target.host;
+    flat['host'] = upstreamUrl.host;
     flat['content-length'] = String(body.length);
 
-    const requestFn = target.protocol === 'https:' ? https.request : http.request;
+    const requestFn = upstreamUrl.protocol === 'https:' ? https.request : http.request;
     const upstreamReq = requestFn({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      protocol: upstreamUrl.protocol,
+      hostname: upstreamUrl.hostname,
+      port: upstreamUrl.port || (upstreamUrl.protocol === 'https:' ? 443 : 80),
       method,
       path,
       headers: flat,
@@ -314,7 +361,11 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     get requestCount(): number {
       return served;
     },
-    close: (): Promise<void> => new Promise((resolve) => server.close(() => resolve())),
+    capture: captureSession,
+    close: async (): Promise<void> => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await captureSession?.close();
+    },
   };
 }
 

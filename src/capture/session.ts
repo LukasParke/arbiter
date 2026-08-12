@@ -274,7 +274,15 @@ export async function startCaptureSession(options: CaptureSessionOptions): Promi
           streamError = err.message;
           resolve();
         });
-        upstreamRes.on('close', () => resolve());
+        upstreamRes.on('close', () => {
+          // A close without a prior end is a truncated upstream stream even
+          // when Node surfaces no error event (e.g. socket destroy).
+          if (!completed && !clientAborted) {
+            upstreamAborted = true;
+            streamError = streamError ?? 'upstream connection closed before completion';
+          }
+          resolve();
+        });
       });
 
       sseParser?.end();

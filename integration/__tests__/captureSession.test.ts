@@ -155,7 +155,7 @@ describe('exact capture byte fidelity', () => {
     expect(exchange.response.stream.terminalMarker).toBe('message_stop');
   });
 
-  it('records upstream abort with truncation evidence', async () => {
+  it('records upstream destroy as an aborted, truncated stream with error evidence', async () => {
     const upstream = await startUpstream((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.write('data: {"partial":true}\n\n');
@@ -173,8 +173,41 @@ describe('exact capture byte fidelity', () => {
     await session.waitForIdle();
 
     const exchange = session.exchanges()[0];
+    expect(exchange.response.stream.kind).toBe('sse');
     expect(exchange.response.stream.completed).toBe(false);
+    expect(exchange.response.stream.upstreamAborted).toBe(true);
+    expect(exchange.response.stream.clientAborted).toBe(false);
+    expect(exchange.response.stream.error).toBeTruthy();
     expect(exchange.response.stream.terminalMarker).toBeNull();
+    // The bytes delivered before truncation are still captured exactly.
+    const out = tmpdir();
+    const { bundle } = await session.export({ output: path.join(out, 'c') });
+    expect(bundle.readBody(bundle.exchanges[0].response.body).toString('utf-8')).toBe(
+      'data: {"partial":true}\n\n'
+    );
+  });
+
+  it('records a mid-stream socket close (no error event) as truncation', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"partial":');
+      setTimeout(() => res.socket?.destroy(), 20);
+    });
+    cleanups.push(() => void upstream.server.close());
+
+    const session = await startSession(upstream.url, { mode: 'observe' });
+    const res = await fetch(new URL('/v1/json', session.url));
+    try {
+      await res.arrayBuffer();
+    } catch {
+      /* truncation surfaces as a fetch error */
+    }
+    await session.waitForIdle();
+
+    const exchange = session.exchanges()[0];
+    expect(exchange.response.stream.completed).toBe(false);
+    expect(exchange.response.stream.upstreamAborted).toBe(true);
+    expect(exchange.response.stream.error).toBeTruthy();
   });
 
   it('requests identity encoding in exact mode', async () => {
@@ -343,11 +376,12 @@ describe('exact capture byte fidelity', () => {
     cleanups.push(() => void upstream.server.close());
 
     const session = await startSession(upstream.url);
+    const sentBody = '{ "model" :  "m",\n\t"weird": [1,2 ,3] }';
     await (
       await fetch(new URL('/v1/messages', session.url), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: '{"model":"m"}',
+        body: sentBody,
       })
     ).arrayBuffer();
     await session.waitForIdle();
@@ -360,17 +394,86 @@ describe('exact capture byte fidelity', () => {
     const reloaded = loadBundle(path.join(out, 'capture'));
     expect(reloaded.manifest.bundleDigest).toBe(manifest.bundleDigest);
 
+    // The persisted request bytes are exactly what the client sent.
+    expect(reloaded.readBody(reloaded.exchanges[0].request.body).toString('utf-8')).toBe(sentBody);
+    expect(bundle.readBody(bundle.exchanges[0].request.body).toString('utf-8')).toBe(sentBody);
+
     const har = exchangesToHar(reloaded.exchanges, reloaded.manifest.targetOrigin, (b) =>
       reloaded.readBody(b)
     );
     expect(har.log.entries).toHaveLength(1);
-    expect(har.log.entries[0].request.postData?.text).toBe('{"model":"m"}');
+    expect(har.log.entries[0].request.postData?.text).toBe(sentBody);
     expect(har.log.entries[0].response.content.text).toBe('{"ok":true}');
 
     const jsonl = exchangesToTrafficJsonl(reloaded.exchanges, (b) => reloaded.readBody(b));
     const line = JSON.parse(jsonl.trim());
     expect(line.method).toBe('POST');
     expect(line.response_status).toBe(200);
+  });
+
+  it('keeps every export artifact secret-free: bundle files, HAR, and JSONL', async () => {
+    const SECRET = 'sk-live-credential-abc123';
+    const upstream = await startUpstream((_req, res) => {
+      res.setHeader('set-cookie', ['session=server-side-cookie-value']);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    cleanups.push(() => void upstream.server.close());
+
+    const session = await startSession(upstream.url);
+    await (
+      await fetch(new URL('/v1/data?api_key=query-secret-value&page=1', session.url), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${SECRET}`,
+          cookie: 'sid=client-cookie-value',
+        },
+        body: '{"model":"m"}',
+      })
+    ).arrayBuffer();
+    await session.waitForIdle();
+
+    const out = tmpdir();
+    const bundleDir = path.join(out, 'capture');
+    const { bundle } = await session.export({ output: bundleDir });
+
+    const secrets = [
+      SECRET,
+      'query-secret-value',
+      'server-side-cookie-value',
+      'client-cookie-value',
+    ];
+
+    // Every file in the bundle directory is secret-free.
+    const walk = (dir: string): string[] =>
+      fs
+        .readdirSync(dir, { withFileTypes: true })
+        .flatMap((entry) =>
+          entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]
+        );
+    for (const file of walk(bundleDir)) {
+      const content = fs.readFileSync(file).toString('utf-8');
+      for (const secret of secrets) {
+        expect(content, `${file} must not contain ${secret.slice(0, 8)}…`).not.toContain(secret);
+      }
+    }
+
+    // Derived HAR and JSONL views are secret-free too.
+    const har = JSON.stringify(
+      exchangesToHar(bundle.exchanges, bundle.manifest.targetOrigin, (b) => bundle.readBody(b))
+    );
+    const jsonl = exchangesToTrafficJsonl(bundle.exchanges, (b) => bundle.readBody(b));
+    for (const secret of secrets) {
+      expect(har).not.toContain(secret);
+      expect(jsonl).not.toContain(secret);
+    }
+
+    // Redaction evidence is present rather than the values.
+    expect(bundle.exchanges[0].request.headers.redacted).toEqual(
+      expect.arrayContaining(['authorization', 'cookie'])
+    );
+    expect(bundle.exchanges[0].response.headers.redacted).toContain('set-cookie');
   });
 
   it('round-trips binary response bytes through HAR base64 encoding', async () => {

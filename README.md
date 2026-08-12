@@ -164,10 +164,13 @@ Sanitize reloads an untrusted bundle with full verification, re-applies redactio
 ### Credential gateway
 
 ```bash
-arbiter gateway --policy policy.json --credential-command 'op read op://vault/anthropic/key'
+arbiter gateway --policy policy.json --credential-command 'op read op://vault/anthropic/key' \
+  --capture-output ./gateway-capture
 ```
 
-The policy pins a sha256 of an opaque client token plus expiry, target origin, methods, path prefixes, optional models, and request/byte/duration ceilings. The client never sees the upstream credential; the credential command's stdout is consumed as a secret and never logged.
+The policy pins a sha256 of an opaque client token plus expiry, target origin, methods, path prefixes, optional models, and request/byte/duration ceilings. The client never sees the upstream credential; the credential command's stdout is consumed as a secret and never logged. Oversized requests receive a clean `413` JSON response.
+
+With `--capture-output` (or `capture: {}` in library use), allowed gateway traffic is routed through an exact `CaptureSession` and exported as a deterministic bundle on shutdown. The gateway fails closed if the injected credential header is not covered by the capture redaction policy, so neither the gateway token nor the upstream credential can reach the bundle.
 
 ### Library usage
 

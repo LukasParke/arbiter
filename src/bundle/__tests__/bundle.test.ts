@@ -90,10 +90,12 @@ describe('bundle write/load', () => {
     expect(bundle.manifest.bundleDigest).toBe(bundleDigest([exchange]));
   });
 
-  it('is deterministic: identical content yields identical files', () => {
+  it('is deterministic: identical content yields identical files, including body blobs', () => {
+    const bigRequest = Buffer.alloc(INLINE_BODY_LIMIT + 64, 0x5a);
+    const bigResponse = Buffer.alloc(INLINE_BODY_LIMIT + 128, 0xa5);
     const write = (target: string): void => {
       const bodies = new Map<string, Buffer>();
-      const exchanges = [makeExchange(0, bodies), makeExchange(1, bodies)];
+      const exchanges = [makeExchange(0, bodies, bigRequest, bigResponse), makeExchange(1, bodies)];
       writeBundle(target, { manifest: manifestBase, exchanges, bodies });
     };
     write(path.join(dir, 'a'));
@@ -101,6 +103,16 @@ describe('bundle write/load', () => {
     for (const file of ['manifest.json', 'exchanges.ndjson']) {
       expect(fs.readFileSync(path.join(dir, 'a', file))).toEqual(
         fs.readFileSync(path.join(dir, 'b', file))
+      );
+    }
+    // The content-addressed body files must match too: same names, same bytes.
+    const bodiesA = fs.readdirSync(path.join(dir, 'a', 'bodies')).sort();
+    const bodiesB = fs.readdirSync(path.join(dir, 'b', 'bodies')).sort();
+    expect(bodiesA).toEqual(bodiesB);
+    expect(bodiesA.length).toBeGreaterThanOrEqual(2);
+    for (const name of bodiesA) {
+      expect(fs.readFileSync(path.join(dir, 'a', 'bodies', name))).toEqual(
+        fs.readFileSync(path.join(dir, 'b', 'bodies', name))
       );
     }
   });

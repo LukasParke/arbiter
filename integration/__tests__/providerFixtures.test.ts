@@ -157,6 +157,15 @@ describe('provider-shaped golden fixtures', () => {
     const out = tmpdir();
     const { bundle } = await session.export({ output: path.join(out, 'capture') });
 
+    // Exported request bodies must be byte-exact copies of what was sent.
+    const messagesExchange = bundle.exchanges.find(
+      (e) => e.request.path.split('?')[0] === '/v1/messages'
+    );
+    expect(messagesExchange).toBeDefined();
+    expect(bundle.readBody(messagesExchange!.request.body).toString('utf-8')).toBe(
+      '{"model":"claude-3","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+    );
+
     // Replay the whole capture against the same upstream shape: exact bytes.
     const replayUpstream = await startProviderUpstream();
     const report = await replayCapture(bundle, {
@@ -165,11 +174,23 @@ describe('provider-shaped golden fixtures', () => {
     });
     expect(report.summary.passed).toBe(5);
 
-    // And semantic SSE mode also passes.
+    // Semantic SSE mode applies only to SSE exchanges: the three streams
+    // pass, and the two buffered JSON exchanges fail loudly instead of
+    // matching vacuously.
     const sseReport = await replayCapture(bundle, {
       target: replayUpstream.origin,
       mode: 'semantic-sse-response',
     });
-    expect(sseReport.summary.passed).toBe(5);
+    expect(sseReport.summary.passed).toBe(3);
+    expect(sseReport.summary.failed).toBe(2);
+    for (const result of sseReport.results) {
+      const exchange = bundle.exchanges.find((e) => e.sequence === result.sequence)!;
+      if (exchange.response.stream.kind === 'sse') {
+        expect(result.comparison?.match).toBe(true);
+      } else {
+        expect(result.comparison?.match).toBe(false);
+        expect(result.comparison?.detail).toMatch(/not SSE/i);
+      }
+    }
   });
 });
