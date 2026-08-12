@@ -294,7 +294,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This repo auto-publishes to npm on push to `main` if the version in `package.json` is newer than the version on npm.
 
 Setup (one-time):
-- Add a repository secret `NPM_TOKEN` with publish rights for the package.
+- On npmjs.com → `@parke.dev/arbiter` → Settings → Trusted Publisher, add GitHub Actions:
+  - Organization or user: `LukasParke`
+  - Repository: `arbiter`
+  - Workflow filename: `publish.yml`
 
 Manual run:
 - You can also trigger the workflow manually from the Actions tab (workflow_dispatch).
