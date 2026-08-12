@@ -5,6 +5,10 @@ import path from 'path';
 
 export type BodyLimitPolicy = 'spill' | 'fail';
 
+/** Hard ceiling for spilled bodies: spill moves storage to disk, it does not
+ * remove limits entirely. 4 GiB default. */
+export const MAX_SPILLED_BODY_BYTES = 4 * 1024 * 1024 * 1024;
+
 export class BodyLimitExceededError extends Error {
   constructor(limit: number) {
     super(`Body exceeded configured limit of ${limit} bytes`);
@@ -28,7 +32,8 @@ export class BodySink {
   constructor(
     private readonly limit: number,
     private readonly policy: BodyLimitPolicy,
-    private readonly spillDir: string = os.tmpdir()
+    private readonly spillDir: string = os.tmpdir(),
+    private readonly spillLimit: number = MAX_SPILLED_BODY_BYTES
   ) {}
 
   write(chunk: Buffer): void {
@@ -38,6 +43,11 @@ export class BodySink {
     this.hash.update(chunk);
     this.byteCount += chunk.length;
     if (this.spillFd !== null) {
+      // Spill changes the storage medium, not the contract: crossing the
+      // spill ceiling is still a hard failure, never silent truncation.
+      if (this.byteCount > this.spillLimit) {
+        this.abortWith(new BodyLimitExceededError(this.spillLimit));
+      }
       fs.writeSync(this.spillFd, chunk);
       return;
     }
@@ -46,8 +56,16 @@ export class BodySink {
       if (this.policy === 'fail') {
         throw new BodyLimitExceededError(this.limit);
       }
+      if (this.byteCount > this.spillLimit) {
+        this.abortWith(new BodyLimitExceededError(this.spillLimit));
+      }
       this.spill();
     }
+  }
+
+  private abortWith(error: Error): never {
+    this.abort();
+    throw error;
   }
 
   get size(): number {

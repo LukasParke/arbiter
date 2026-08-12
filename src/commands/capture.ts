@@ -24,6 +24,16 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+function parsePositiveInt(value: string, flag: string, opts: { allowZero?: boolean } = {}): number {
+  const parsed = Number(value);
+  const min = opts.allowZero ? 0 : 1;
+  if (!Number.isInteger(parsed) || parsed < min) {
+    console.error(chalk.red(`${flag} must be an integer >= ${min} (got ${value})`));
+    process.exit(1);
+  }
+  return parsed;
+}
+
 export const captureCommand = new Command('capture')
   .description('Run an exact-capture proxy and export a deterministic capture bundle on shutdown')
   .requiredOption('-t, --target <url>', 'upstream API origin to proxy to')
@@ -64,6 +74,13 @@ export const captureCommand = new Command('capture')
   .option('--ready-file <path>', 'write listener metadata JSON atomically once ready')
   .option('--report <path>', 'write a machine-readable final report on shutdown')
   .action(async (options: CaptureCliOptions) => {
+    const port = parsePositiveInt(options.port, '--port', { allowZero: true });
+    const maxBodyBytes = parsePositiveInt(options.maxBodyBytes, '--max-body-bytes');
+    const idleTimeoutMs =
+      options.idleTimeout !== undefined
+        ? parsePositiveInt(options.idleTimeout, '--idle-timeout')
+        : undefined;
+
     const rejectSecrets: string[] = [];
     for (const envName of options.rejectSecret) {
       const value = process.env[envName];
@@ -81,10 +98,10 @@ export const captureCommand = new Command('capture')
 
     const session = await startCaptureSession({
       target: options.target,
-      listen: { hostname: options.host, port: parseInt(options.port, 10) },
+      listen: { hostname: options.host, port },
       mode: options.exact ? 'exact' : 'observe',
       redaction,
-      maxBodyBytes: parseInt(options.maxBodyBytes, 10),
+      maxBodyBytes,
     });
 
     console.info(chalk.green('Arbiter capture proxy listening'));
@@ -106,21 +123,18 @@ export const captureCommand = new Command('capture')
 
     let idleTimer: NodeJS.Timeout | null = null;
     const armIdle = (): void => {
-      if (!options.idleTimeout) {
+      if (idleTimeoutMs === undefined) {
         return;
       }
       if (idleTimer) {
         clearTimeout(idleTimer);
       }
-      idleTimer = setTimeout(
-        () => {
-          console.info(chalk.yellow('Idle timeout reached, shutting down'));
-          void shutdown(0);
-        },
-        parseInt(options.idleTimeout, 10)
-      );
+      idleTimer = setTimeout(() => {
+        console.info(chalk.yellow('Idle timeout reached, shutting down'));
+        void shutdown(0);
+      }, idleTimeoutMs);
     };
-    if (options.idleTimeout) {
+    if (idleTimeoutMs !== undefined) {
       const interval = setInterval(() => {
         // Re-arm on traffic: exchanges() grows as requests settle.
         if (session.exchanges().length !== lastCount) {

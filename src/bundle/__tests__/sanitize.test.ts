@@ -116,6 +116,23 @@ describe('sanitizeBundle', () => {
     expect(() => sanitizeBundle(input, { output: out })).toThrow(/not empty/i);
   });
 
+  it('normalizes targetOrigin, stripping userinfo credentials', () => {
+    const input = path.join(dir, 'in');
+    writeDirtyBundle(input);
+    // Tamper the manifest to carry credentials in the target URL, fixing the
+    // digest is unnecessary because sanitize revalidates exchanges only.
+    const manifestPath = path.join(input, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    manifest.targetOrigin = 'https://user:supersecretpw@api.example.com/some/path?x=1';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    // loadBundle inside sanitize revalidates; recompute nothing else — the
+    // manifest digest covers exchanges, not itself.
+    const result = sanitizeBundle(input, { output: path.join(dir, 'out') });
+    expect(result.bundle.manifest.targetOrigin).toBe('https://api.example.com');
+    const written = fs.readFileSync(path.join(dir, 'out', 'manifest.json'), 'utf-8');
+    expect(written).not.toContain('supersecretpw');
+  });
+
   it('produces a loadable deterministic bundle', () => {
     const input = path.join(dir, 'in');
     writeDirtyBundle(input);

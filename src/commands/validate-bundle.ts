@@ -46,7 +46,8 @@ export const validateBundleCommand = new Command('validate')
     }
 
     if (options.report) {
-      fs.writeFileSync(options.report, JSON.stringify(report, null, 2));
+      fs.writeFileSync(options.report, JSON.stringify(report, null, 2), { mode: 0o600 });
+      fs.chmodSync(options.report, 0o600); // mode option only applies at creation
       console.info(chalk.gray(`Report written to ${options.report}`));
     }
 

@@ -79,6 +79,23 @@ Blocking gap fixed: **gateway now composes with CaptureSession**. `GatewayOption
 
 223 tests passing (was 197).
 
+## CodeRabbit review remediation (15 threads)
+
+- session: persistent upstreamReq error listener (uncaught-exception kill fixed — critical)
+- sse: streaming TextDecoder (split multi-byte UTF-8), held-back CR for split CRLF pairs
+- redaction: redactPath preserves original query text verbatim for allowed pairs (no URLSearchParams re-encoding, bare flags intact); replay substitutes only redacted values pair-by-pair
+- secretScan: header NAMES scanned (generic finding location, never echoing the name); zlib decompression bounded with maxOutputLength (bomb guard)
+- bodySink: hard spill ceiling (default 4 GiB) — spill changes medium, not contract; ceiling breach cleans up and fails
+- sanitize: targetOrigin normalized to bare origin (userinfo credentials stripped)
+- server (legacy observe): sensitive-named query values redacted before HAR/OpenAPI/SQLite
+- derive JSONL: explicit request/response_body_encoding: 'base64' markers so consumers can't mistake encoded binary for text
+- gateway: upstream request timeout (policy.maxDurationMs) + persistent error listener; credential-command timeout kills the whole process tree (detached group)
+- validation: CommandValidator timeout kills the process tree
+- replay: bounded response buffering (512 MiB default), post-response request error listener
+- CLI: capture validates --port/--max-body-bytes/--idle-timeout (NaN no longer disables limits); gateway validates --port and reports startup failures cleanly; report files written 0600 + chmod
+
+231 tests passing (was 223).
+
 ## Blockers
 
 - none

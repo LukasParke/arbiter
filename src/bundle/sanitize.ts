@@ -92,11 +92,15 @@ export function sanitizeBundle(inputDir: string, options: SanitizeOptions): Sani
     throw new SecretFindingError(findings);
   }
 
+  // Normalize the target to a bare origin: an untrusted manifest could
+  // carry userinfo credentials (https://user:secret@host) or a path/query.
+  const targetOrigin = new URL(input.manifest.targetOrigin).origin;
+
   writeBundle(outputRoot, {
     manifest: {
       arbiterVersion: ARBITER_VERSION,
       mode: input.manifest.mode,
-      targetOrigin: input.manifest.targetOrigin,
+      targetOrigin,
       startedAt: input.manifest.startedAt,
       completedAt: input.manifest.completedAt,
       redaction: redaction.summary(),

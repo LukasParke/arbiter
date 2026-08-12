@@ -152,6 +152,31 @@ describe('scanExchanges', () => {
     expect(findings).toHaveLength(0);
   });
 
+  it('scans header names without echoing them in findings', () => {
+    const bodies = new Map<string, Buffer>();
+    const secretName = 'sk-ant-api03-abcdefghijk';
+    const exchange = exchangeWith(bodies, {
+      headers: { [secretName]: ['benign'] },
+    });
+    const findings = scanExchanges([exchange], bodies, undefined, noOptions);
+    expect(findings.length).toBeGreaterThan(0);
+    // The finding location is generic; the secret header name never appears.
+    expect(JSON.stringify(findings)).not.toContain(secretName);
+    expect(findings.some((f) => f.location.includes('header name'))).toBe(true);
+  });
+
+  it('rejects caller secrets hidden in header names', () => {
+    const bodies = new Map<string, Buffer>();
+    const exchange = exchangeWith(bodies, {
+      headers: { 'x-hunter2-super-secret': ['v'] },
+    });
+    const findings = scanExchanges([exchange], bodies, undefined, {
+      ...noOptions,
+      rejectSecrets: ['hunter2-super-secret'],
+    });
+    expect(findings.some((f) => f.kind === 'caller-rejected-secret')).toBe(true);
+  });
+
   it('passes clean captures', () => {
     const bodies = new Map<string, Buffer>();
     const exchange = exchangeWith(bodies, {

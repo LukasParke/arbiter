@@ -165,10 +165,16 @@ export class CommandValidator implements ContractValidator {
     body: Buffer
   ): Promise<Violation[]> {
     return new Promise((resolve, reject) => {
-      const child = spawn(this.command, { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
+      // detached puts the shell in its own process group so a timeout can
+      // kill the whole tree, not just the shell wrapper.
+      const child = spawn(this.command, {
+        shell: true,
+        stdio: ['pipe', 'pipe', 'inherit'],
+        detached: process.platform !== 'win32',
+      });
       const chunks: Buffer[] = [];
       const timer = setTimeout(() => {
-        child.kill();
+        killTree(child.pid);
         reject(new Error(`Validator command timed out after ${this.timeoutMs}ms`));
       }, this.timeoutMs);
       child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -198,6 +204,21 @@ export class CommandValidator implements ContractValidator {
       child.stdin.on('error', () => undefined);
       child.stdin.end(JSON.stringify({ exchange, direction, bodyBase64: body.toString('base64') }));
     });
+  }
+}
+
+function killTree(pid: number | undefined): void {
+  if (pid === undefined) {
+    return;
+  }
+  try {
+    if (process.platform !== 'win32') {
+      process.kill(-pid, 'SIGKILL'); // negative pid: the whole process group
+    } else {
+      process.kill(pid, 'SIGKILL');
+    }
+  } catch {
+    /* already exited */
   }
 }
 

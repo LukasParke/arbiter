@@ -66,7 +66,11 @@ export interface ReplayOptions {
   rejectUnauthorized?: boolean;
   /** Per-exchange timeout in ms. Default 120000. */
   timeoutMs?: number;
+  /** Max buffered replay response bytes. Default 512 MiB. */
+  maxResponseBytes?: number;
 }
+
+const DEFAULT_REPLAY_MAX_RESPONSE_BYTES = 512 * 1024 * 1024;
 
 export interface ReplayExchangeResult {
   sequence: number;
@@ -182,22 +186,27 @@ async function replayExchange(
   if (redactedNames.length > 0) {
     const missing: string[] = [];
     const queryStart = replayPath.indexOf('?');
-    const params = new URLSearchParams(replayPath.slice(queryStart + 1));
-    const rebuilt = new URLSearchParams();
-    for (const [name, value] of params) {
-      if (value === REDACTED_VALUE) {
+    // Rebuild pair-by-pair so allowed (non-redacted) pairs keep their
+    // original text; only redacted values are substituted.
+    const rebuiltPairs = replayPath
+      .slice(queryStart + 1)
+      .split('&')
+      .map((pair) => {
+        const eq = pair.indexOf('=');
+        if (eq === -1 || pair.slice(eq + 1) !== REDACTED_VALUE) {
+          return pair;
+        }
+        const rawName = pair.slice(0, eq);
+        const name = decodeQueryName(rawName);
         const replacement = options.queryValueProvider?.(name, exchange);
         if (replacement === undefined) {
           if (!missing.includes(name)) {
             missing.push(name);
           }
-          continue;
+          return pair;
         }
-        rebuilt.append(name, replacement);
-      } else {
-        rebuilt.append(name, value);
-      }
-    }
+        return `${rawName}=${encodeURIComponent(replacement)}`;
+      });
     if (missing.length > 0) {
       return {
         ...base,
@@ -209,7 +218,7 @@ async function replayExchange(
         durationMs: Date.now() - start,
       };
     }
-    replayPath = `${replayPath.slice(0, queryStart)}?${rebuilt.toString()}`;
+    replayPath = `${replayPath.slice(0, queryStart)}?${rebuiltPairs.join('&')}`;
   }
 
   try {
@@ -251,9 +260,24 @@ async function replayExchange(
     req.end();
 
     const [res] = (await once(req, 'response')) as [http.IncomingMessage];
+    // once() removed its temporary error listener when 'response' fired; a
+    // later request-side error must not become an uncaught exception.
+    req.on('error', () => {
+      /* surfaced through the response error below */
+    });
+    const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_REPLAY_MAX_RESPONSE_BYTES;
     const chunks: Buffer[] = [];
-    res.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let received = 0;
     await new Promise<void>((resolve, reject) => {
+      res.on('data', (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > maxResponseBytes) {
+          res.destroy();
+          reject(new Error(`Replay response exceeded ${maxResponseBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('end', resolve);
       res.on('error', reject);
     });
@@ -311,6 +335,14 @@ function runComparison(
       return compareSemanticJson(expected, actual, options.normalization);
     case 'semantic-sse-response':
       return compareSemanticSse(expected, actual, options.normalization);
+  }
+}
+
+function decodeQueryName(text: string): string {
+  try {
+    return decodeURIComponent(text.replace(/\+/g, ' '));
+  } catch {
+    return text;
   }
 }
 

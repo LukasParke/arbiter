@@ -85,4 +85,26 @@ describe('SseParser', () => {
     expect(events).toHaveLength(1);
     expect(events[0].data).toBe('x');
   });
+
+  it('decodes multi-byte UTF-8 split across chunk boundaries', () => {
+    const text = 'data: {"delta":"日本語"}\n\n';
+    const bytes = Buffer.from(text, 'utf-8');
+    // Split in the middle of the second multi-byte character.
+    const splitAt = bytes.indexOf(Buffer.from('本', 'utf-8')) + 1;
+    const parser = new SseParser();
+    parser.feed(bytes.subarray(0, splitAt));
+    parser.feed(bytes.subarray(splitAt));
+    parser.end();
+    expect(parser.parsedEvents).toHaveLength(1);
+    expect(parser.parsedEvents[0].data).toBe('{"delta":"日本語"}');
+    expect(parser.parsedEvents[0].data).not.toContain('\uFFFD');
+  });
+
+  it('handles a CRLF pair split across chunks', () => {
+    const parser = new SseParser();
+    parser.feed(Buffer.from('data: one\r\n\r'));
+    parser.feed(Buffer.from('\ndata: two\r\n\r\n'));
+    parser.end();
+    expect(parser.parsedEvents.map((e) => e.data)).toEqual(['one', 'two']);
+  });
 });

@@ -102,9 +102,13 @@ export interface TrafficLine {
   path: string;
   request_headers: Record<string, string>;
   request_body: string | null;
+  /** Present (as 'base64') when request_body is not UTF-8 text. */
+  request_body_encoding?: 'base64';
   response_status: number;
   response_headers: Record<string, string>;
   response_body: string | null;
+  /** Present (as 'base64') when response_body is not UTF-8 text. */
+  response_body_encoding?: 'base64';
 }
 
 export function exchangesToTrafficJsonl(
@@ -114,15 +118,19 @@ export function exchangesToTrafficJsonl(
   const lines = exchanges.map((exchange) => {
     const requestBytes = readBody(exchange.request.body);
     const responseBytes = readBody(exchange.response.body);
+    const request = bodyToText(requestBytes, exchange.request.body);
+    const response = bodyToText(responseBytes, exchange.response.body);
     const line: TrafficLine = {
       timestamp: exchange.startedAt,
       method: exchange.request.method,
       path: exchange.request.path,
       request_headers: firstValues(exchange.request.headers.values),
-      request_body: bodyToText(requestBytes, exchange.request.body),
+      request_body: request.text,
+      ...(request.encoding ? { request_body_encoding: request.encoding } : {}),
       response_status: exchange.response.status,
       response_headers: firstValues(exchange.response.headers.values),
-      response_body: bodyToText(responseBytes, exchange.response.body),
+      response_body: response.text,
+      ...(response.encoding ? { response_body_encoding: response.encoding } : {}),
     };
     return JSON.stringify(line);
   });
@@ -162,9 +170,16 @@ function encodeContent(bytes: Buffer, body: CapturedBody): { text: string; encod
   return { text: bytes.toString('base64'), encoding: 'base64' };
 }
 
-function bodyToText(bytes: Buffer, body: CapturedBody): string | null {
+function bodyToText(
+  bytes: Buffer,
+  body: CapturedBody
+): { text: string | null; encoding?: 'base64' } {
   if (bytes.length === 0) {
-    return null;
+    return { text: null };
   }
-  return isTextual(body) ? bytes.toString('utf-8') : bytes.toString('base64');
+  // Base64 output is explicitly marked so JSONL consumers never mistake
+  // encoded binary for literal text.
+  return isTextual(body)
+    ? { text: bytes.toString('utf-8') }
+    : { text: bytes.toString('base64'), encoding: 'base64' };
 }

@@ -101,6 +101,9 @@ function scanHeaderValues(
   scanText: (text: string, location: string) => void
 ): void {
   for (const [name, headerValues] of Object.entries(values)) {
+    // Header NAMES can carry secrets too. Scan them with a generic location
+    // so the finding never echoes the (potentially secret) name itself.
+    scanText(name, `${location} (header name)`);
     for (const value of headerValues) {
       scanText(value, `${location} (${name})`);
     }
@@ -148,22 +151,26 @@ function scanBody(
   }
 }
 
+/** Decompression bomb guard for analysis views. */
+const MAX_DECODED_ANALYSIS_BYTES = 256 * 1024 * 1024;
+
 function decodeAnalysisView(bytes: Buffer, contentEncoding: string | null): Buffer | null {
   if (contentEncoding === null || contentEncoding === 'identity') {
     return bytes;
   }
+  const limits = { maxOutputLength: MAX_DECODED_ANALYSIS_BYTES };
   try {
     switch (contentEncoding.toLowerCase()) {
       case 'gzip':
       case 'x-gzip':
-        return zlib.gunzipSync(bytes);
+        return zlib.gunzipSync(bytes, limits);
       case 'deflate':
-        return zlib.inflateSync(bytes);
+        return zlib.inflateSync(bytes, limits);
       case 'br':
-        return zlib.brotliDecompressSync(bytes);
+        return zlib.brotliDecompressSync(bytes, limits);
       case 'zstd':
         return typeof zlib.zstdDecompressSync === 'function'
-          ? zlib.zstdDecompressSync(bytes)
+          ? zlib.zstdDecompressSync(bytes, limits)
           : null;
       default:
         return null;

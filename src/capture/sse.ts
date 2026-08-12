@@ -42,15 +42,19 @@ export function terminalMarkerFor(event: SseEvent): string | null {
  */
 export class SseParser {
   private buffer = '';
+  private readonly decoder = new TextDecoder('utf-8');
   private readonly events: SseEvent[] = [];
   private terminal: string | null = null;
 
   feed(chunk: Buffer): void {
-    this.buffer += chunk.toString('utf-8');
+    // Streaming decode: a multi-byte UTF-8 sequence split across chunks
+    // must not decode to U+FFFD halves.
+    this.buffer += this.decoder.decode(chunk, { stream: true });
     this.drain(false);
   }
 
   end(): void {
+    this.buffer += this.decoder.decode();
     this.drain(true);
   }
 
@@ -63,11 +67,20 @@ export class SseParser {
   }
 
   private drain(flush: boolean): void {
+    // A CRLF pair split across chunks must not be treated as a bare CR
+    // separator: when not flushing, hold back a trailing CR until the next
+    // chunk reveals whether an LF follows.
+    let working = this.buffer;
+    let heldCr = '';
+    if (!flush && working.endsWith('\r')) {
+      working = working.slice(0, -1);
+      heldCr = '\r';
+    }
     // Normalize separators for boundary detection only (analysis copy).
-    const normalized = this.buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const normalized = working.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const parts = normalized.split('\n\n');
     const complete = flush ? parts : parts.slice(0, -1);
-    this.buffer = flush ? '' : (parts[parts.length - 1] ?? '');
+    this.buffer = flush ? '' : (parts[parts.length - 1] ?? '') + heldCr;
     for (const block of complete) {
       if (block.trim().length === 0) {
         continue;

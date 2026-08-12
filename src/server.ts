@@ -349,11 +349,16 @@ export async function startServers({
                 return;
               }
 
-              // Extract query parameters
+              // Extract query parameters. Values whose names look credential-
+              // bearing are redacted before they can reach HAR, OpenAPI
+              // examples, or SQLite; benign values are kept for discovery
+              // (legacy observe semantics — exact capture redacts by default).
               const queryParams: Record<string, string> = {};
               const urlSearchParams = new URLSearchParams(originalUrl.search);
               urlSearchParams.forEach((value, key) => {
-                queryParams[key] = value;
+                queryParams[key] = defaultRedactionPolicy.isSensitiveName(key)
+                  ? REDACTED_VALUE
+                  : value;
               });
 
               // Extract request headers, redacting credential values before

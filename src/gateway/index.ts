@@ -295,7 +295,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
       path,
       headers: flat,
       rejectUnauthorized: options.rejectUnauthorized ?? true,
+      // An upstream that accepts the connection but never responds must not
+      // hold the client open forever; bound by the policy's session budget.
+      timeout: policy.maxDurationMs,
     } as https.RequestOptions);
+    upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('upstream request timed out')));
+    upstreamReq.on('error', () => {
+      /* surfaced through the once(response) rejection or response handling */
+    });
     if (body.length > 0) {
       upstreamReq.write(body);
     }
@@ -435,10 +442,23 @@ export function credentialProviderFromCommand(
 ): GatewayCredentialProvider {
   return async (): Promise<Record<string, string>> => {
     const secret = await new Promise<string>((resolve, reject) => {
-      const child = spawn(command, { shell: true, stdio: ['ignore', 'pipe', 'inherit'] });
+      // detached: a timeout must kill the whole shell process tree.
+      const child = spawn(command, {
+        shell: true,
+        stdio: ['ignore', 'pipe', 'inherit'],
+        detached: process.platform !== 'win32',
+      });
       const chunks: Buffer[] = [];
       const timer = setTimeout(() => {
-        child.kill();
+        try {
+          if (process.platform !== 'win32' && child.pid !== undefined) {
+            process.kill(-child.pid, 'SIGKILL');
+          } else {
+            child.kill('SIGKILL');
+          }
+        } catch {
+          /* already exited */
+        }
         reject(new Error('Credential command timed out'));
       }, options.timeoutMs ?? 30_000);
       child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));

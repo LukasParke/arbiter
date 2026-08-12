@@ -65,6 +65,18 @@ describe('RedactionPolicy', () => {
   it('leaves paths without query untouched', () => {
     expect(defaultRedactionPolicy.redactPath('/v1/messages')).toBe('/v1/messages');
   });
+
+  it('preserves the original query form for allowed pairs (no re-encoding)', () => {
+    const policy = new RedactionPolicy({ allowQuery: ['q', 'flag', 'sp'] });
+    // percent-escapes, bare flags, and encoded spaces survive byte-for-byte
+    expect(policy.redactPath('/s?q=a%2Fb&flag&sp=a%20b')).toBe('/s?q=a%2Fb&flag&sp=a%20b');
+    // redacted pair keeps its raw name; only the value is replaced
+    expect(policy.redactPath('/s?q=keep&tok%65n=secret')).toBe('/s?q=keep&tok%65n=__redacted__');
+  });
+
+  it('keeps bare flags intact under redaction', () => {
+    expect(defaultRedactionPolicy.redactPath('/s?flag')).toBe('/s?flag');
+  });
 });
 
 describe('captureHeaders', () => {

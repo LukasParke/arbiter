@@ -43,24 +43,46 @@ export const gatewayCommand = new Command('gateway')
       process.exit(1);
     }
 
-    const gateway = await startGateway({
-      policy,
-      credentialProvider: credentialProviderFromCommand(
-        options.credentialCommand,
-        options.credentialHeader,
-        options.credentialPrefix !== undefined ? { prefix: options.credentialPrefix } : {}
-      ),
-      listen: { hostname: options.host, port: parseInt(options.port, 10) },
-      ...(options.captureOutput ? { capture: {} } : {}),
-      onRequest: (event) => {
-        const mark = event.allowed ? chalk.green('✓') : chalk.red('✗');
-        console.info(
-          mark,
-          `${event.method} ${event.path}`,
-          event.allowed ? String(event.status) : chalk.red(event.denyReason ?? 'denied')
-        );
-      },
-    });
+    const port = Number(options.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      console.error(chalk.red(`--port must be an integer 0-65535 (got ${options.port})`));
+      process.exit(1);
+    }
+
+    let gateway: Awaited<ReturnType<typeof startGateway>>;
+    try {
+      gateway = await startGatewayWith(policy, port, options);
+    } catch (err) {
+      console.error(
+        chalk.red('Failed to start gateway:'),
+        err instanceof Error ? err.message : err
+      );
+      process.exit(1);
+    }
+    function startGatewayWith(
+      gatewayPolicy: GatewayPolicy,
+      listenPort: number,
+      cli: GatewayCliOptions
+    ): ReturnType<typeof startGateway> {
+      return startGateway({
+        policy: gatewayPolicy,
+        credentialProvider: credentialProviderFromCommand(
+          cli.credentialCommand,
+          cli.credentialHeader,
+          cli.credentialPrefix !== undefined ? { prefix: cli.credentialPrefix } : {}
+        ),
+        listen: { hostname: cli.host, port: listenPort },
+        ...(cli.captureOutput ? { capture: {} } : {}),
+        onRequest: (event) => {
+          const mark = event.allowed ? chalk.green('✓') : chalk.red('✗');
+          console.info(
+            mark,
+            `${event.method} ${event.path}`,
+            event.allowed ? String(event.status) : chalk.red(event.denyReason ?? 'denied')
+          );
+        },
+      });
+    }
 
     console.info(chalk.green('Arbiter gateway listening'));
     console.info(chalk.cyan(`  Gateway: ${gateway.url.toString()}`));

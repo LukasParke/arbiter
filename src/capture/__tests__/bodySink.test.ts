@@ -39,6 +39,17 @@ describe('BodySink', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('enforces the hard spill ceiling instead of unbounded disk growth', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arbiter-sink-'));
+    // memory limit 4 bytes, spill ceiling 16 bytes
+    const sink = new BodySink(4, 'spill', dir, 16);
+    sink.write(Buffer.from('01234567')); // spills
+    expect(() => sink.write(Buffer.from('89abcdefXX'))).toThrow(BodyLimitExceededError);
+    // Ceiling breach also cleans the spill file up.
+    expect(fs.readdirSync(dir)).toHaveLength(0);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('abort removes spill files', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arbiter-sink-'));
     const sink = new BodySink(2, 'spill', dir);

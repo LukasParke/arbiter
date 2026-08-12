@@ -143,6 +143,13 @@ export async function startCaptureSession(options: CaptureSessionOptions): Promi
         headers: flattenHeaders({ ...upstreamHeaders, host: [target.host] }),
         rejectUnauthorized: options.rejectUnauthorized ?? true,
       } as https.RequestOptions);
+      // once(upstreamReq, 'response') removes its temporary error listener
+      // when the response arrives; without a persistent one, any later
+      // request-side error (e.g. socket reset while streaming the body)
+      // becomes an uncaught exception and kills the process.
+      upstreamReq.on('error', () => {
+        /* surfaced through response-side error/close handling */
+      });
 
       clientReq.on('data', (chunk: Buffer) => {
         try {

@@ -54,8 +54,19 @@ export class RedactionPolicy {
   }
 
   /**
+   * Name-based sensitivity check for contexts that keep benign query values
+   * (legacy observe mode). Exact capture uses shouldRedactQueryValue, which
+   * redacts by default.
+   */
+  isSensitiveName(name: string): boolean {
+    return SENSITIVE_HEADER_PATTERN.test(name);
+  }
+
+  /**
    * Redact query values in a path+query string. Names are retained; values
-   * are replaced with a fixed placeholder unless allowed.
+   * are replaced with a fixed placeholder unless allowed. The original query
+   * text is preserved verbatim for allowed pairs — no re-encoding, no `+`
+   * normalization, and bare flags (`?flag`) keep their form.
    */
   redactPath(pathWithQuery: string): string {
     const queryStart = pathWithQuery.indexOf('?');
@@ -63,13 +74,23 @@ export class RedactionPolicy {
       return pathWithQuery;
     }
     const pathname = pathWithQuery.slice(0, queryStart);
-    const params = new URLSearchParams(pathWithQuery.slice(queryStart + 1));
-    const out = new URLSearchParams();
-    for (const [name, value] of params) {
-      out.append(name, this.shouldRedactQueryValue(name) ? REDACTED_VALUE : value);
+    const rawQuery = pathWithQuery.slice(queryStart + 1);
+    if (rawQuery.length === 0) {
+      return pathWithQuery;
     }
-    const query = out.toString();
-    return query.length > 0 ? `${pathname}?${query}` : pathname;
+    const pairs = rawQuery.split('&').map((pair) => {
+      const eq = pair.indexOf('=');
+      const rawName = eq === -1 ? pair : pair.slice(0, eq);
+      const decodedName = tryDecode(rawName);
+      if (!this.shouldRedactQueryValue(decodedName)) {
+        return pair; // preserved byte-for-byte
+      }
+      if (eq === -1) {
+        return pair; // bare flag carries no value to redact
+      }
+      return `${rawName}=${REDACTED_VALUE}`;
+    });
+    return `${pathname}?${pairs.join('&')}`;
   }
 
   summary(): { redactHeaders: string[]; allowQuery: string[] } {
@@ -93,12 +114,28 @@ export function redactedQueryNames(pathWithQuery: string): string[] {
     return [];
   }
   const names: string[] = [];
-  for (const [name, value] of new URLSearchParams(pathWithQuery.slice(queryStart + 1))) {
-    if (value === REDACTED_VALUE && !names.includes(name)) {
-      names.push(name);
+  for (const pair of pathWithQuery.slice(queryStart + 1).split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq === -1) {
+      continue;
+    }
+    const value = pair.slice(eq + 1);
+    if (value === REDACTED_VALUE) {
+      const name = tryDecode(pair.slice(0, eq));
+      if (!names.includes(name)) {
+        names.push(name);
+      }
     }
   }
   return names;
+}
+
+function tryDecode(text: string): string {
+  try {
+    return decodeURIComponent(text.replace(/\+/g, ' '));
+  } catch {
+    return text;
+  }
 }
 
 function globToRegExp(glob: string): RegExp {
