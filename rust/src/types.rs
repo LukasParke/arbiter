@@ -13,7 +13,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub const EXCHANGE_SCHEMA_VERSION: u64 = 1;
-pub const BUNDLE_SCHEMA_VERSION: u64 = 1;
+/// Bundle format version written by this build. Writers stamp 1 for
+/// HTTP-only captures (byte-identical to TS output, frozen interchange) and
+/// 2 only when v2 extension content (tunnel/tls/ws/llm) is present.
+/// Loaders accept both (see bundle::validate::validate_manifest).
+pub const BUNDLE_SCHEMA_VERSION: u64 = 2;
+/// Exchange-line schema version; additive optional fields keep lines at 1.
+pub const EXCHANGE_SCHEMA_VERSION_V2: u64 = 1;
 
 /// Lowercased header names; duplicate values keep array order.
 pub type HeaderMapValues = BTreeMap<String, Vec<String>>;
@@ -109,6 +115,139 @@ pub struct CapturedExchange {
     pub response: CapturedResponse,
     pub failure: Option<CaptureFailure>,
     pub validation: Option<ValidationSummary>,
+    /// CONNECT tunnel metadata when this exchange flowed through a tunneled
+    /// HTTPS connection (v2, absent on plain HTTP captures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<TunnelInfo>,
+    /// TLS handshake details for intercepted or TLS-terminated exchanges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsExchangeInfo>,
+    /// Captured WebSocket message stream (v2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsStream>,
+    /// LLM provider fingerprint extracted from this exchange (v2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmMeta>,
+}
+
+// ---------------------------------------------------------------------------
+// Capture schema v2 — additive members. All are optional with
+// `skip_serializing_if` so HTTP-only records serialize byte-identically to
+// v1 (frozen TS interchange, AMEND-13).
+// ---------------------------------------------------------------------------
+
+/// Direction of a captured WebSocket message relative to the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WsDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// RFC 6455 opcodes captured by the recorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WsOpcode {
+    Text,
+    Binary,
+    Ping,
+    Pong,
+    Close,
+}
+
+/// One captured WebSocket message. Text frames carry `text`; other frames
+/// carry `dataBase64`. `offsetMs` is milliseconds since exchange start and is
+/// stripped from the bundle digest (timing provenance).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsMessage {
+    pub direction: WsDirection,
+    pub opcode: WsOpcode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    pub size: u64,
+    pub offset_ms: f64,
+}
+
+/// Captured WebSocket session attached to a proxied exchange.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsStream {
+    /// Negotiated subprotocol from Sec-WebSocket-Protocol, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    pub messages: Vec<WsMessage>,
+    /// True when the stream ended with a Close frame or terminal error.
+    pub completed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+}
+
+/// CONNECT tunnel metadata for exchanges that flowed through an intercepted
+/// or pass-through HTTPS tunnel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelInfo {
+    /// Authority host from the CONNECT request line.
+    pub host: String,
+    pub port: u16,
+    /// True when TLS was terminated locally (intercepted), false when the
+    /// tunnel was passed through untouched.
+    pub intercepted: bool,
+    /// Negotiated ALPN protocol on the client side, e.g. "h2", "http/1.1".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+}
+
+/// TLS handshake details for intercepted/TLS-terminated exchanges.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsExchangeInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher_suite: Option<String>,
+    /// Server name indication presented by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+}
+
+/// LLM provider fingerprint extracted from request/response shapes (W4).
+/// Populated by `arbiter::llm` at capture settle time or batch analysis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmMeta {
+    /// Detected provider id, e.g. "anthropic", "openai", "ollama".
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub streaming: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// sha256 of the types-only normalized shape of the request body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_shape_fp: Option<String>,
+    /// sha256 of the types-only normalized shape of the response body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_shape_fp: Option<String>,
+    /// True when this exchange's shape fingerprint differs from every other
+    /// exchange sharing (provider, path, model) in the same analysis set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape_drift: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +349,10 @@ mod tests {
             },
             failure: None,
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         }
     }
 

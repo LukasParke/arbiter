@@ -1,0 +1,1 @@
+//! TUI application state machine.

@@ -555,6 +555,10 @@ fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
             },
             failure: outcome.failure.clone(),
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         };
         if let Some(hook) = &inner.validation {
             let violations = hook(&exchange);

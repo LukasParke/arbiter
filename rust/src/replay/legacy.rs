@@ -141,6 +141,10 @@ fn line_to_exchange(line: &LegacyTrafficLine, sequence: u64) -> Result<CapturedE
         },
         failure: None,
         validation: None,
+        tunnel: None,
+        tls: None,
+        ws: None,
+        llm: None,
     })
 }
 

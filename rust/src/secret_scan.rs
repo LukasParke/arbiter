@@ -397,6 +397,10 @@ mod tests {
             },
             failure: None,
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         }
     }
 

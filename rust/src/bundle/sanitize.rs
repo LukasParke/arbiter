@@ -172,6 +172,10 @@ pub fn sanitize_bundle(input_dir: &Path, options: &SanitizeOptions) -> Result<Sa
             },
             failure: exchange.failure.clone(),
             validation: exchange.validation,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         });
     }
 
@@ -300,6 +304,10 @@ mod tests {
             },
             failure: None,
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         };
         write_bundle(
             input,

@@ -50,6 +50,14 @@ pub enum Error {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    #[error("TLS error: {0}")]
+    Tls(#[from] crate::tls::TlsError),
+
+    #[error(
+        "exchange {seq} carries a WebSocket stream and cannot be replayed via HTTP replay modes"
+    )]
+    WebsocketNotReplayable { seq: u64 },
+
     #[error("{0}")]
     Other(String),
 }

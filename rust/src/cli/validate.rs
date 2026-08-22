@@ -180,6 +180,10 @@ paths:
             },
             failure: None,
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         };
         let manifest = crate::types::CaptureManifest {
             schema_version: 1,

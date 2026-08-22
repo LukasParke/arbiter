@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::types::{
     BodyStorage, CaptureFailure, CaptureManifest, CaptureMode, CapturedBody, CapturedExchange,
     CapturedHeaders, CapturedRequest, CapturedResponse, HeaderMapValues, RedactionPolicySummary,
-    StreamState, ValidationSummary, BUNDLE_SCHEMA_VERSION, EXCHANGE_SCHEMA_VERSION,
+    StreamState, ValidationSummary, EXCHANGE_SCHEMA_VERSION,
 };
 
 /// Bounds applied before parsing/allocating untrusted input.
@@ -132,7 +132,8 @@ fn as_string_array(
 
 pub fn validate_manifest(raw: &Value) -> Result<CaptureManifest, Error> {
     let m = as_record(raw, "manifest")?;
-    if m.get("schemaVersion").and_then(|v| v.as_u64()) != Some(BUNDLE_SCHEMA_VERSION) {
+    let observed_manifest_version = m.get("schemaVersion").and_then(Value::as_u64);
+    if !matches!(observed_manifest_version, Some(1) | Some(2)) {
         return Err(fail(
             "manifest.schemaVersion",
             format!(
@@ -188,7 +189,7 @@ pub fn validate_manifest(raw: &Value) -> Result<CaptureManifest, Error> {
         }
     };
     Ok(CaptureManifest {
-        schema_version: BUNDLE_SCHEMA_VERSION,
+        schema_version: observed_manifest_version.unwrap_or(1),
         arbiter_version: as_string(
             m.get("arbiterVersion").unwrap_or(&Value::Null),
             "manifest.arbiterVersion",
@@ -574,7 +575,33 @@ pub fn validate_exchange(raw: &Value, index: usize) -> Result<CapturedExchange, 
         response,
         failure,
         validation,
+        tunnel: as_optional_ext(e, "tunnel", &format!("{location}.tunnel"))?,
+        tls: as_optional_ext(e, "tls", &format!("{location}.tls"))?,
+        ws: as_optional_ext(e, "ws", &format!("{location}.ws"))?,
+        llm: as_optional_ext(e, "llm", &format!("{location}.llm"))?,
     })
+}
+
+/// Upper bound applied to each optional v2 extension block before decoding,
+/// preserving the bounded-allocation loader posture for untrusted input.
+const MAX_EXTENSION_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+
+fn as_optional_ext<T: serde::de::DeserializeOwned>(
+    e: &serde_json::Map<String, Value>,
+    key: &str,
+    location: &str,
+) -> Result<Option<T>, Error> {
+    match e.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            if v.to_string().len() > MAX_EXTENSION_BLOCK_BYTES {
+                return Err(fail(location, "extension block exceeds permitted size"));
+            }
+            serde_json::from_value(v.clone())
+                .map(Some)
+                .map_err(|err| fail(location, format!("invalid structure: {err}")))
+        }
+    }
 }
 
 pub fn validate_sequence_order(exchanges: &[CapturedExchange]) -> Result<(), Error> {

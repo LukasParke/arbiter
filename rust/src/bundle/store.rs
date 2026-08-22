@@ -227,8 +227,14 @@ pub fn write_bundle(output_dir: &Path, options: WriteBundleOptions) -> Result<Ca
         }
     }
 
+    // Stamp manifest schemaVersion 1 for HTTP-only captures (byte-identical
+    // to TS writer output — frozen interchange) and 2 only when v2 extension
+    // content (tunnel/tls/ws/llm) is present.
+    let needs_v2 = exchanges
+        .iter()
+        .any(|e| e.tunnel.is_some() || e.tls.is_some() || e.ws.is_some() || e.llm.is_some());
     let manifest = CaptureManifest {
-        schema_version: BUNDLE_SCHEMA_VERSION,
+        schema_version: if needs_v2 { BUNDLE_SCHEMA_VERSION } else { 1 },
         exchange_count: exchanges.len() as u64,
         bundle_digest: bundle_digest(&exchanges),
         ..options.manifest
@@ -499,6 +505,10 @@ mod tests {
             },
             failure: None,
             validation: None,
+            tunnel: None,
+            tls: None,
+            ws: None,
+            llm: None,
         }
     }
 
