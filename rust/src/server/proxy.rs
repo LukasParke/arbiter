@@ -153,6 +153,7 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
     let recorder = Arc::clone(&shared);
     let record_method = method.to_string();
     let record_body = request_body.clone();
+    let record_status = status.as_u16();
     tokio::spawn(async move {
         let mut buffer = Vec::new();
         let mut stream = upstream_response.bytes_stream();
@@ -171,22 +172,28 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
             }
         }
         drop(tx);
-        record_exchange(
-            &recorder,
-            RecordMeta {
-                started_at_ms,
-                time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
-                method: record_method,
-                path,
-                raw_query,
-                request_headers,
-                request_body: record_body,
-                status: status.as_u16(),
-                response_headers,
-            },
-            &buffer,
-        )
-        .await;
+        // Recording is fully synchronous CPU work (schema inference, JSON
+        // tree building, gzip decode). Run it on the blocking pool so it
+        // never occupies async worker threads: bursts of recording must not
+        // starve response polling under concurrency.
+        let recorder = Arc::clone(&recorder);
+        tokio::task::spawn_blocking(move || {
+            record_exchange(
+                &recorder,
+                RecordMeta {
+                    started_at_ms,
+                    time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
+                    method: record_method,
+                    path,
+                    raw_query,
+                    request_headers,
+                    request_body: record_body,
+                    status: record_status,
+                    response_headers,
+                },
+                &buffer,
+            )
+        });
     });
 
     let mut builder = Response::builder().status(status);
@@ -212,7 +219,7 @@ struct RecordMeta {
 
 /// Background recording: HAR entry, OpenAPI endpoint, and optional SQLite
 /// persistence — all best-effort, never failing the proxied exchange.
-async fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8]) {
+fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8]) {
     let response_content_type = first_value(&meta.response_headers, "content-type")
         .unwrap_or_default()
         .to_string();
