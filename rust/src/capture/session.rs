@@ -1636,8 +1636,9 @@ mod tests {
                                 break;
                             }
                             Message::Text(_) | Message::Binary(_) => {
-                                if ws.send(message).await.is_err() {
-                                    break;
+                                let sent = ws.send(message).await;
+                                if sent.is_err() {
+                                    break; // receiver gone
                                 }
                             }
                             _ => {}

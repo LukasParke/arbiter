@@ -1,3 +1,5 @@
+//!
+#![allow(dead_code)] // surfaces wired during M3d/next cutover
 //! `arbiter complete <shell>` — shell completion generation (W7).
 //!
 //! Uses `clap_complete` (approved dependency) to emit completion scripts for
@@ -118,7 +120,7 @@ mod tests {
         assert!(
             script.contains("__arbiter") || script.contains("complete "),
             "bash script should register completion: first 200 bytes: {}",
-            &script.chars().take(200).collect::<String>()
+            script.chars().take(200).collect::<String>().as_str()
         );
     }
 

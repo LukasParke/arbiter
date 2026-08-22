@@ -665,14 +665,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let big_tail = "x".repeat(12_000); // pushes the response past inline limit
-        let streaming_response_body = format!(
-            concat!(
+        let streaming_response_body = concat!(
                 "event: message_start\n",
-                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":24,\"output_tokens\":1}}}}}}\n\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":24,\"output_tokens\":1}}}\n\n",
                 "event: message_delta\n",
-                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":101}}}}\n\n"
-            ),
-        ) + &format!("event: padding\ndata: \"{big_tail}\"\n\n");
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":101}}\n\n"
+            )
+            .to_string()
+            + &format!("event: padding\ndata: \"{big_tail}\"\n\n");
 
         let small = anthropic_exchange(1, "claude-sonnet-4");
         let mut streamed = make_exchange(

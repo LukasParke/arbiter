@@ -301,7 +301,7 @@ mod tests {
         // Missing file: pure defaults.
         let defaults = effective_config().unwrap();
         assert_eq!(defaults.start.port, None);
-        assert_eq!(defaults.capture.exact, false);
+        assert!(!defaults.capture.exact);
 
         // File layer.
         std::fs::write(
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(layered.start.port, Some(9443));
         assert_eq!(layered.capture.host.as_deref(), Some("from-file"));
         // Defaults still populate untouched leaves.
-        assert_eq!(layered.start.docs_only, false);
+        assert!(!layered.start.docs_only);
 
         // Env layer beats the file.
         std::env::set_var("ARBITER_START_PORT", "9999");

@@ -694,6 +694,7 @@ mod tests {
         assert_eq!(events[2].status, 200);
     }
 
+    #[allow(clippy::await_holding_lock)] // deliberate whole-test env exclusion
     #[tokio::test]
     async fn credential_command_consumes_env_printing_stdout() {
         let _env_guard = crate::config::test_support::env_test_lock();

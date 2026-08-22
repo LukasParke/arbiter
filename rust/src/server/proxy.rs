@@ -29,11 +29,9 @@ use crate::headers::{
 };
 use crate::middleware::{build_har_entry, HarEntryParts, HarStore};
 use crate::redaction::{RedactionPolicy, REDACTED_VALUE};
-use crate::rules::hooks::{
-    run_request_hook, run_response_hook, HookConfig, HookContext, HookOutcome,
-};
+use crate::rules::hooks::{run_request_hook, run_response_hook, HookConfig, HookContext};
 use crate::rules::HeaderRuleSet;
-use crate::server::connect::{decide, parse_authority};
+use crate::server::connect::parse_authority;
 use crate::server::intercept::{serve_intercepted, InterceptTlsConfig};
 use crate::storage::SqliteStore;
 use crate::store::OpenApiStore;
@@ -119,7 +117,7 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
 
 /// Plain entry point shared by the axum router and TLS-intercepted
 /// connections (M3a): every request funnels here exactly once.
-async fn handle_request(shared: Arc<ProxyShared>, mut req: Request) -> Response {
+async fn handle_request(shared: Arc<ProxyShared>, req: Request) -> Response {
     // The pipeline handed to TLS-intercepted streams: plain HTTP entry that
     // rejects nested CONNECT (proxy chaining) — this keeps the handler tree
     // free of static recursion, so futures stay Send.
@@ -304,9 +302,8 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
     // Live OpenAPI validation, request leg (W7). Runs on the final forwarded
     // headers/body; the paired response leg happens inside record_exchange.
     // Violations are recorded best-effort and never alter the traffic.
-    let validation_seq = if shared.validate.is_some() {
+    let validation_seq = if let Some(validator) = shared.validate.as_ref() {
         let seq = shared.next_sequence();
-        let validator = shared.validate.as_ref().expect("checked above");
         let violations = validator.validate_request_parts(
             seq,
             method.as_str(),
@@ -488,7 +485,7 @@ async fn handle_connect(
             let upgrade = hyper::upgrade::on(&mut req);
             tokio::spawn(async move {
                 match upgrade.await {
-                    Ok(mut client_io) => match parse_authority(&authority) {
+                    Ok(client_io) => match parse_authority(&authority) {
                         Ok(target) => {
                             match tokio::net::TcpStream::connect((
                                 target.host.as_str(),
@@ -529,7 +526,7 @@ async fn handle_connect(
 async fn handle_websocket(
     shared: Arc<ProxyShared>,
     req: Request,
-    started_at_ms: i64,
+    _started_at_ms: i64,
     path_and_query: String,
     request_headers: HeaderMapValues,
 ) -> Response {
@@ -858,7 +855,7 @@ fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8])
                 meta.validation_seq,
                 meta.status,
                 &meta.response_headers,
-                Some(&response_body),
+                Some(response_body),
             );
             if !violations.is_empty() {
                 validator.collector.record(meta.validation_seq, violations);
@@ -1076,6 +1073,12 @@ pub(crate) async fn bind_listener(port: u16) -> Result<(tokio::net::TcpListener,
     }
 }
 
+#[allow(dead_code)]
+fn _sync_probe() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<ProxyShared>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1277,42 +1280,4 @@ mod tests {
         assert!(shared.openapi.all_endpoints().is_empty());
         assert_eq!(shared.har.entry_count(), 0);
     }
-}
-
-#[allow(dead_code)]
-fn _send_probe(shared: Arc<ProxyShared>, req: Request) {
-    fn assert_send<F: std::future::Future + Send>(f: F) -> F {
-        f
-    }
-    let _ = assert_send(handle_request(shared, req));
-}
-
-#[allow(dead_code)]
-fn _send_probe2(
-    shared: Arc<ProxyShared>,
-    authority: String,
-    mut decrypted: http::Request<hyper::body::Incoming>,
-) {
-    fn require_send<F: std::future::Future + Send>(f: F) -> F {
-        f
-    }
-    let _ = require_send(async move {
-        let path_q = decrypted
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
-        let absolute = format!("https://{authority}{path_q}");
-        if let Ok(u) = absolute.parse() {
-            *decrypted.uri_mut() = u;
-        }
-        let decrypted = decrypted.map(axum::body::Body::new);
-        handle_request(shared, decrypted).await
-    });
-}
-
-#[allow(dead_code)]
-fn _sync_probe() {
-    fn assert_sync<T: Sync>() {}
-    assert_sync::<ProxyShared>();
 }

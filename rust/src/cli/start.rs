@@ -275,6 +275,7 @@ fn resolve_layered(args: &StartArgs, matches: Option<&ArgMatches>) -> Result<Sta
 // ---------------------------------------------------------------------------
 
 /// Direct entry (library/tests): no config layering, every value explicit.
+#[allow(dead_code)] // superseded by run_layered; kept for direct embedding
 pub fn run(args: &StartArgs) -> i32 {
     run_layered(args, None)
 }

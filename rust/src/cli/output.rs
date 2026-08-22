@@ -1,3 +1,5 @@
+//!
+#![allow(dead_code)] // surfaces wired during M3d/next cutover
 //! Single output funnel for every result-printing command (W7 DX bar).
 //!
 //! - [`emit`] routes between human rendering and `--json` output. JSON uses
@@ -243,7 +245,7 @@ mod tests {
         emit(
             OutputFormat::Human,
             || {},
-            serde_json::to_value(&f64::NAN).unwrap_or(Value::Null), // NaN is not valid JSON
+            serde_json::to_value(f64::NAN).unwrap_or(Value::Null), // NaN is not valid JSON
         );
 
         // Json: routed through stable stringify regardless of field order.

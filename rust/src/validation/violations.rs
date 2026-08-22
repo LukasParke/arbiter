@@ -354,6 +354,12 @@ pub fn exit_code(summary: &ViolationsSummary, fail_on_violation: bool) -> i32 {
     }
 }
 
+impl std::fmt::Debug for LiveValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveValidator").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,11 +683,5 @@ paths:
         );
         assert!(flags.fail_on_violation);
         assert!(flags.wants_validation());
-    }
-}
-
-impl std::fmt::Debug for LiveValidator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LiveValidator").finish_non_exhaustive()
     }
 }

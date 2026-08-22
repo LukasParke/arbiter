@@ -41,8 +41,10 @@ pub struct LeafStats {
 }
 
 /// Fixed-cap, insertion-order-evicting leaf certificate cache.
+type CertifiedKeyStore = (HashMap<String, Arc<CertifiedKey>>, VecDeque<String>);
+
 pub struct LeafCache {
-    inner: Mutex<(HashMap<String, Arc<CertifiedKey>>, VecDeque<String>)>,
+    inner: Mutex<CertifiedKeyStore>,
     cap: usize,
     hits: AtomicU64,
     misses: AtomicU64,

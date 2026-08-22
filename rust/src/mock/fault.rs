@@ -260,6 +260,17 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ---------------------------------------------------------------------------
 
+impl Clone for FaultInjector {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            state: std::sync::atomic::AtomicU64::new(
+                self.state.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,16 +378,5 @@ mod tests {
         let g = garbage_bytes(32);
         assert_eq!(g.len(), 32);
         assert!(g.iter().all(|b| b.is_ascii_hexdigit()));
-    }
-}
-
-impl Clone for FaultInjector {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            state: std::sync::atomic::AtomicU64::new(
-                self.state.load(std::sync::atomic::Ordering::Relaxed),
-            ),
-        }
     }
 }

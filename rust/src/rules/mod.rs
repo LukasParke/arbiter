@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(req.ops.len(), 1);
         assert_eq!(resp.apply_phase, ApplyPhase::Response);
         assert_eq!(resp.ops.len(), 2);
-        assert!(req.is_empty() == false && resp.is_empty() == false);
+        assert!(!req.is_empty() && !resp.is_empty());
     }
 
     #[test]

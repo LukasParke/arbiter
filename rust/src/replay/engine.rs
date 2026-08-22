@@ -836,6 +836,7 @@ mod tests {
 
     // ---- unreplayable redacted query values ----
 
+    #[allow(clippy::await_holding_lock)] // deliberate whole-test env exclusion
     #[tokio::test]
     async fn redacted_query_without_replacement_is_unreplayable() {
         let _env_guard = crate::config::test_support::env_test_lock();
@@ -902,6 +903,7 @@ mod tests {
 
     // ---- credential injection ----
 
+    #[allow(clippy::await_holding_lock)] // deliberate whole-test env exclusion
     #[tokio::test]
     async fn credential_env_injects_header_upstream() {
         let _env_guard = crate::config::test_support::env_test_lock();
@@ -981,6 +983,7 @@ mod tests {
 
     // ---- secret scan ----
 
+    #[allow(clippy::await_holding_lock)] // deliberate whole-test env exclusion
     #[tokio::test]
     async fn reject_secret_env_scans_bundle_before_replay() {
         let _env_guard = crate::config::test_support::env_test_lock();

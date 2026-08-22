@@ -248,6 +248,7 @@ impl FlowDetailDto {
 /// Embedded transport attached to a live capture session. New-flow ticks
 /// arrive on the session's watch channel; batches pull summaries past the
 /// cursor via `flow_summaries(after, limit)`.
+#[allow(dead_code)] // reserved for watch-driven refresh
 pub struct EmbeddedFlowFeed {
     /// Upstream origin replays are re-sent against (the capture target).
     target: Url,
@@ -347,6 +348,7 @@ impl HttpFlowFeed {
 /// Transport-agnostic feed operations used by the TUI event loop. Native
 /// async-fn-in-trait: the app always holds a concrete [`FlowFeed`], so no
 /// dyn dispatch is required.
+#[allow(async_fn_in_trait)]
 pub trait FlowFeedExt {
     /// Pulls the next batch of new summaries (empty when nothing changed).
     async fn next_batch(&mut self) -> Vec<FlowSummaryDto>;

@@ -47,6 +47,7 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Start the proxy and documentation servers

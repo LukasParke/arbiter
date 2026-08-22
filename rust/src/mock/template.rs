@@ -217,7 +217,7 @@ mod tests {
         let (out, rep) = render_with_report("keep {{ secret.sauce }} and {{request.path}}", &c);
         assert_eq!(out, "keep {{ secret.sauce }} and /x");
         assert_eq!(rep.unknown_tokens, 1);
-        assert!(unknown_token_warnings() >= before + 1);
+        assert!(unknown_token_warnings() > before);
         // Same unknown token again: still verbatim, counter still grows.
         let (out2, _) = render_with_report("{{ secret.sauce }}", &c);
         assert_eq!(out2, "{{ secret.sauce }}");

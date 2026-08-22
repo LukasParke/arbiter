@@ -5,9 +5,9 @@
 
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
-use crate::llm::{fingerprint_bundle, ExchangeFingerprint, FingerprintReport};
+use crate::llm::{fingerprint_bundle, FingerprintReport};
 
 /// Fingerprint LLM provider traffic recorded in a capture bundle.
 ///
@@ -162,7 +162,10 @@ fn print_table(report: &FingerprintReport) {
 
 #[cfg(test)]
 mod tests {
+    use super::FingerprintCommand;
     use super::*;
+    use crate::llm::ExchangeFingerprint;
+    use clap::CommandFactory;
 
     #[test]
     fn table_renders_aligned_columns_and_drift_lines() {

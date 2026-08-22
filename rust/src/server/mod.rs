@@ -148,7 +148,6 @@ fn spawn_listener(
 /// and new traffic is persisted best-effort (failures never break
 /// proxying). Ports walk forward to the next free port on collision, like
 /// the TS `findAvailablePort`.
-
 pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
     if options.docs_only && options.proxy_only {
         return Err(Error::other(

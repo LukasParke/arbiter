@@ -809,6 +809,7 @@ mod tests {
         assert!(app.show_raw);
     }
 
+    #[allow(dead_code)] // key-mapping table drift guard
     fn quit_sets_flag_via_mapped_key() {
         let mut app = App::new(None, store());
         let actions = map_key(

@@ -761,7 +761,7 @@ tls_key = "key.pem"
 "#;
         let cfg: FileConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.start.port, Some(8080));
-        assert_eq!(cfg.start.proxy_only, true);
+        assert!(cfg.start.proxy_only);
         assert_eq!(cfg.capture.reject_secret, vec!["sk-ant-"]);
         assert_eq!(cfg.replay.mode.as_deref(), Some("semantic-json-response"));
         assert_eq!(cfg.tui.saved_filters.len(), 1);
