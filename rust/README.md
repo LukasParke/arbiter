@@ -35,6 +35,52 @@ cargo test                     # unit + loopback integration tests
 | `src/diff.rs`, `src/generate_spec.rs` | `src/diff.ts`, `src/generate-spec.ts` | Spec drift tooling |
 | `src/cli/` | `src/cli.ts`, `src/commands/*` | Command surface (`arbiter start/capture/replay/gateway/sanitize/validate/...`) |
 
+## Proxy-parity expansion (feat/proxy-parity)
+
+Built on the Rust port, this wave closes the functional gap to mitmproxy /
+Wiretap / Hoverfly / WireMock / Prism (LiteLLM gateway features excluded):
+
+- **TLS interception (mitmproxy parity)** — `arbiter ca` generates/loads a
+  root CA; CONNECT tunnels are intercepted with dynamic per-host leaf certs
+  (825-day validity, Apple-trust compatible), or pass through untouched via
+  `--tls-passthrough` globs; `--tls-cert/--tls-key` serve reverse-proxy HTTPS;
+  ALPN h2 + HTTP/1.1 both directions.
+- **WebSocket relay + capture** — upgrades are forwarded transparently,
+  messages recorded into bundle-v2 `ws` records (direction, opcode, payload,
+  close state); h2c prior-knowledge supported on plaintext listeners.
+- **Mock / simulate engine** — `arbiter mock --spec x.yaml` (Prism-parity
+  example generation, CORS, hot reload) or `--capture DIR` (byte-exact
+  recorded-response replay with strongest-match scoring); fault injection
+  (`--fault-status/--fault-latency-ms/--fault-error`) usable in mock AND
+  proxy modes; header rewrite rules (`set:/append:/remove:/rename:`).
+- **Live validation proxy** — `start --validate-spec x.yaml --report r.json
+  --fail-on-violation`: forwards traffic, validates against the spec,
+  records structured violations (seq-keyed request/response pairing).
+- **Purpose-built TUI** — `arbiter tui [--attach URL | --target URL]`:
+  live flow list (100k ring, virtualized), detail viewer with JSON
+  highlighting, filter grammar (`method=GET status=2xx path~/v1/*`),
+  per-flow replay/delete/HAR-export, LLM columns, saved filters.
+- **LLM fingerprinting** — provider detection across anthropic/openai/
+  google/xai/mistral/ollama/openrouter/azure/bedrock from path+auth+body
+  evidence (redacted-header names count as presence); usage-token folding
+  for streaming SSE; types-only shape fingerprints with drift grouping;
+  surfaces as exchange metadata, `arbiter fingerprint`, `/__fingerprint`.
+- **Hooks & modification** — `--on-request/--on-response` subprocess or
+  `--hook-server` webhook (redacted views in, modified-exchange out,
+  fail-open on timeout); ordered header rule engine.
+- **DX plumbing** — `complete bash|zsh|fish|powershell`, layered config
+  file (`config init/show/path`; defaults < file < env < CLI), global
+  `--json`, cause+help error lines everywhere.
+
+Perf (measured, release build): startup-to-listening 83–96 ms warm; proxy
+overhead ~1–4% vs upstream-bound baseline at c=16 (385 rps local fixture);
+recording spills to disk past 32 MiB so memory stays bounded; clippy
+-D warnings clean; 441 tests green.
+
+Known follow-ups: nested CONNECT (proxy chaining) rejected by design;
+TUI HTTP-attach requires a capture-session surface (embedded mode is the
+primary UX); streaming NDJSON responses lack response_shape_fp.
+
 ## Compatibility guarantees
 
 - **Bundle format**: byte-identical manifests and NDJSON exchange encoding
