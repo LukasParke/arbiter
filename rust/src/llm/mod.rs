@@ -96,6 +96,7 @@ pub fn fingerprint_exchange(
         path: &exchange.request.path,
         host,
         headers,
+        redacted_header_names: &exchange.request.headers.redacted,
         body: request_json.as_ref(),
     });
     if detection.provider == Provider::Unknown {

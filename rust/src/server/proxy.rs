@@ -861,9 +861,7 @@ fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8])
                 Some(&response_body),
             );
             if !violations.is_empty() {
-                validator
-                    .collector
-                    .record(meta.validation_seq, violations);
+                validator.collector.record(meta.validation_seq, violations);
             }
         }
     }

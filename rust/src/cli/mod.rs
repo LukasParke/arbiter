@@ -117,13 +117,9 @@ pub fn run() -> ! {
         .iter()
         .find_map(|name| {
             let m = matches.subcommand_matches(name)?;
-            // Not every subcommand defines --verbose; unknown ids are
-            // skipped, never panicked on.
-            if m.contains_id("verbose") {
-                Some(m.get_flag("verbose"))
-            } else {
-                None
-            }
+            // Not every subcommand defines --verbose; try_get_one returns
+            // Err instead of panicking when the id is absent.
+            m.try_get_one::<bool>("verbose").ok().flatten().copied()
         })
         .unwrap_or(false);
     crate::cli::output::init_tracing(verbose, json);

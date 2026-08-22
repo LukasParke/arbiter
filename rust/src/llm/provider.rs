@@ -10,7 +10,7 @@
 //! 3. **azure-openai** — host ending `.openai.azure.com`, or an `api-key`
 //!    header paired with an Azure/OpenAI-style path.
 //! 4. **anthropic** — `/v1/messages` or `/v1/complete` path plus an
-//!    `x-api-key` or `anthropic-version` header.
+//!    `X-API-KEY` or `anthropic-version` header.
 //! 5. **xai** — host on `x.ai`, or OpenAI path with a `grok*` body model.
 //! 6. **mistral** — OpenAI-completions path with a Bearer token whose request
 //!    model is prefixed `mistral`/`magistral`, or host `api.mistral.ai`.
@@ -60,7 +60,7 @@ impl Provider {
 }
 
 /// One detection outcome: the provider plus a human-readable reason naming
-/// the winning rule and signals ("path + x-api-key header").
+/// the winning rule and signals ("path + X-API-KEY header").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
     pub provider: Provider,
@@ -85,8 +85,26 @@ pub struct RequestContext<'a> {
     pub host: Option<&'a str>,
     /// Lowercased-name request headers.
     pub headers: &'a HeaderMapValues,
+    /// Names of headers whose values were redacted before persistence.
+    /// Credential-bearing names (X-API-KEY, authorization, ...) survive as
+    /// evidence here even though their values are gone, so provider
+    /// detection works on captured traffic.
+    pub redacted_header_names: &'a [String],
     /// Parsed request JSON body, when the body was JSON.
     pub body: Option<&'a Value>,
+}
+
+impl<'a> RequestContext<'a> {
+    /// True when the header is present in `headers` OR listed among the
+    /// redacted names (value-stripped evidence).
+    pub fn has_header(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.headers.keys().any(|k| k.eq_ignore_ascii_case(&lower))
+            || self
+                .redacted_header_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&lower))
+    }
 }
 
 /// Ordered rule table entry point. Pure; never panics on external input.
@@ -129,7 +147,7 @@ impl ProviderDetector {
                 );
             }
         }
-        if header(ctx.headers, "api-key").is_some()
+        if (header(ctx.headers, "api-key").is_some() || ctx.has_header("api-key"))
             && (bare_path.starts_with("/openai/") || openai_path(bare_path))
         {
             return Detection::new(Provider::AzureOpenAi, "api-key header + openai-style path");
@@ -139,12 +157,11 @@ impl ProviderDetector {
         if matches!(
             bare_path,
             "/v1/messages" | "/v1/complete" | "/v1/messages/count_tokens"
-        ) && (header(ctx.headers, "x-api-key").is_some()
-            || header(ctx.headers, "anthropic-version").is_some())
+        ) && (ctx.has_header("x-api-key") || ctx.has_header("anthropic-version"))
         {
             return Detection::new(
                 Provider::Anthropic,
-                "path /v1/messages|/v1/complete + x-api-key or anthropic-version header",
+                "path /v1/messages|/v1/complete + X-API-KEY or anthropic-version header",
             );
         }
 
@@ -372,6 +389,7 @@ mod tests {
             path,
             host,
             headers: &hs,
+            redacted_header_names: &[],
             body: body.as_ref(),
         })
     }
@@ -382,13 +400,13 @@ mod tests {
             "/v1/messages",
             Some("api.anthropic.com"),
             headers(&[
-                ("x-api-key", "sk-ant-01"),
+                ("X-API-KEY", "sk-ant-01"),
                 ("anthropic-version", "2023-06-01"),
             ]),
             Some(json!({"model": "claude-sonnet-4", "max_tokens": 1024, "messages": []})),
         );
         assert_eq!(d.provider, Provider::Anthropic);
-        assert!(d.reason.contains("x-api-key"));
+        assert!(d.reason.contains("X-API-KEY"));
     }
 
     #[test]
@@ -396,7 +414,7 @@ mod tests {
         let d = detect(
             "/v1/messages",
             None,
-            headers(&[("x-api-key", "sk-ant-01")]),
+            headers(&[("X-API-KEY", "sk-ant-01")]),
             Some(json!({"model": "claude"})),
         );
         assert_eq!(d.provider, Provider::Anthropic);
