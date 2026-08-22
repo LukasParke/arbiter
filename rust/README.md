@@ -77,9 +77,9 @@ overhead ~1–4% vs upstream-bound baseline at c=16 (385 rps local fixture);
 recording spills to disk past 32 MiB so memory stays bounded; clippy
 -D warnings clean; 441 tests green.
 
-Known follow-ups: nested CONNECT (proxy chaining) rejected by design;
-TUI HTTP-attach requires a capture-session surface (embedded mode is the
-primary UX); streaming NDJSON responses lack response_shape_fp.
+All documented follow-ups are addressed: nested CONNECT chaining with a
+depth guard, TUI HTTP-attach to proxy-mode `start` via HAR-backed flows
+API, and NDJSON streaming shape fingerprints.
 
 ## Compatibility guarantees
 
