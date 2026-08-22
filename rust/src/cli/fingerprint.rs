@@ -187,6 +187,7 @@ mod tests {
                 response_fp: None,
             }],
             drift_groups: vec![],
+            note: None,
         };
         // Smoke: printing must not panic and rows include drift marker only
         // when grouped.

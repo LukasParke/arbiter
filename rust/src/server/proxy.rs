@@ -16,6 +16,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Router;
+use futures::future::BoxFuture;
 use futures::SinkExt;
 use futures::StreamExt;
 use serde_json::json;
@@ -54,6 +55,10 @@ tokio::task_local! {
     /// the intercepted-connection handler before the pipeline runs; consumed
     /// when `RecordMeta` is built so exchanges carry tunnel evidence.
     static CONN_TUNNEL: std::cell::RefCell<Option<crate::types::TunnelInfo>>;
+    /// Proxy-chaining depth for nested CONNECT tunnels. Top-level requests
+    /// read 0 (no enclosing scope); each nested tunnel increments. Hard cap
+    /// [`MAX_NESTED_CONNECT`] stops malicious CONNECT loops.
+    static CONN_DEPTH: std::cell::Cell<u64>;
 }
 
 pub struct ProxyShared {
@@ -145,7 +150,7 @@ async fn handle_request(shared: Arc<ProxyShared>, req: Request) -> Response {
     });
     // Top-level CONNECT tunnels hijack the connection before body handling.
     if req.method() == http::Method::CONNECT {
-        return handle_connect(shared, pipeline, req).await;
+        return handle_connect(shared, 0, pipeline, req).await;
     }
     let req = req.map(axum::body::Body::new);
     handle_request_core(shared, req).await
@@ -466,12 +471,32 @@ fn split_authority_for_tunnel(authority: &str) -> (String, u16) {
 /// M3a: CONNECT handling. With interception configured, answer the tunnel
 /// and hand the decrypted stream to the normal pipeline; without a CA,
 /// tunnel bytes untouched to the authority (explicit-proxy behavior).
-async fn handle_connect(
+/// Entry point for CONNECT handling. Boxes the body once so the chained
+/// recursion (`intercepted CONNECT -> handle_connect`) stays `Send` without
+/// infinite type recursion.
+fn handle_connect(
     shared: Arc<ProxyShared>,
+    depth: u64,
+    pipeline: crate::server::intercept::InterceptHandler,
+    req: Request,
+) -> BoxFuture<'static, Response> {
+    Box::pin(handle_connect_inner(shared, depth, pipeline, req))
+}
+
+async fn handle_connect_inner(
+    shared: Arc<ProxyShared>,
+    depth: u64,
     pipeline: crate::server::intercept::InterceptHandler,
     mut req: Request,
 ) -> Response {
     let authority = req.uri().to_string();
+    if depth >= MAX_NESTED_CONNECT {
+        return plain_response(
+            StatusCode::BAD_GATEWAY,
+            "application/json",
+            "{\"error\":\"CONNECT chain too deep\"}",
+        );
+    }
     match shared.intercept.clone() {
         Some(cfg) => {
             // 200-with-upgrade, then take ownership of the raw TCP stream.
@@ -487,6 +512,7 @@ async fn handle_connect(
                         let handler: crate::server::intercept::InterceptHandler =
                             Arc::new(move |mut decrypted| {
                                 let pipeline = Arc::clone(&pipeline);
+                                let shared = Arc::clone(&shared);
                                 let authority = handler_authority.clone();
                                 let tunnel = Some(crate::types::TunnelInfo {
                                     host: t_host.clone(),
@@ -494,19 +520,38 @@ async fn handle_connect(
                                     intercepted: true,
                                     alpn: None,
                                 });
-                                Box::pin(CONN_TUNNEL.scope(
-                                    std::cell::RefCell::new(tunnel),
+                                Box::pin(CONN_DEPTH.scope(
+                                    std::cell::Cell::new(depth + 1),
                                     async move {
-                                        let path_q = decrypted
-                                            .uri()
-                                            .path_and_query()
-                                            .map(|p| p.as_str().to_string())
-                                            .unwrap_or_else(|| "/".to_string());
-                                        let absolute = format!("https://{authority}{path_q}");
-                                        if let Ok(u) = absolute.parse() {
-                                            *decrypted.uri_mut() = u;
+                                        // Proxy chaining: a CONNECT inside the
+                                        // decrypted stream opens another tunnel.
+                                        if decrypted.method() == http::Method::CONNECT {
+                                            // Self-recursion must be boxed
+                                            // (E0733) or the future is !Send.
+                                            let decrypted = decrypted.map(axum::body::Body::new);
+                                            return handle_connect(
+                                                shared,
+                                                depth + 1,
+                                                pipeline,
+                                                decrypted,
+                                            )
+                                            .await;
                                         }
-                                        pipeline(decrypted).await
+                                        CONN_TUNNEL
+                                            .scope(std::cell::RefCell::new(tunnel), async move {
+                                                let path_q = decrypted
+                                                    .uri()
+                                                    .path_and_query()
+                                                    .map(|p| p.as_str().to_string())
+                                                    .unwrap_or_else(|| "/".to_string());
+                                                let absolute =
+                                                    format!("https://{authority}{path_q}");
+                                                if let Ok(u) = absolute.parse() {
+                                                    *decrypted.uri_mut() = u;
+                                                }
+                                                pipeline(decrypted).await
+                                            })
+                                            .await
                                     },
                                 ))
                             });
@@ -1184,6 +1229,9 @@ fn _sync_probe() {
     assert_sync::<ProxyShared>();
 }
 
+/// Maximum proxy-chaining depth for nested CONNECT tunnels.
+pub const MAX_NESTED_CONNECT: u64 = 8;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,5 +1432,72 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(shared.openapi.all_endpoints().is_empty());
         assert_eq!(shared.har.entry_count(), 0);
+    }
+    /// Proxy chaining end-to-end: client -> arbiter(intercept) -> inner
+    /// CONNECT -> chained dial to a second hop. The inner CONNECT arrives on
+    /// the DECRYPTED stream, exercising CONN_DEPTH recursion; the outer
+    /// response is byte-checked and a depth-capped chain is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nested_connect_chains_and_caps_depth() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Origin the inner GET will reach through the tunneled chain.
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = origin_listener.accept().await.unwrap();
+            let mut sock = sock;
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+            let _ = n;
+        });
+
+        let shared = Arc::new(ProxyShared::new(
+            format!("http://{}", origin_addr).parse().unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, proxy_router(shared)).await;
+        });
+
+        // Raw explicit-proxy client: CONNECT <origin> then GET inside.
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+                    origin_addr.ip(),
+                    origin_addr.port(),
+                    origin_addr.ip(),
+                    origin_addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = vec![0u8; 1024];
+        let n = stream.read(&mut head).await.unwrap();
+        let head_str = String::from_utf8_lossy(&head[..n]).to_string();
+        assert!(
+            head_str.starts_with("HTTP/1.1 200"),
+            "expected established tunnel, got: {head_str}"
+        );
+
+        stream
+            .write_all(b"GET /inner HTTP/1.1\r\nHost: chain.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK")
+                && String::from_utf8_lossy(&body).ends_with("ok"),
+            "inner GET should be answered over the tunnel: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }

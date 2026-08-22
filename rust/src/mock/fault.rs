@@ -130,6 +130,10 @@ const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// independent and deterministic under a fixed seed (tests).
 pub struct FaultInjector {
     config: FaultConfig,
+    /// xorshift64* draw state. Relaxed ordering is deliberate: each draw is
+    /// independent by contract ("one roll per request gates everything"), so
+    /// cross-thread visibility of the exact sequence is not required — only
+    /// that every caller observes *a* well-formed xorshift step.
     state: AtomicU64,
 }
 

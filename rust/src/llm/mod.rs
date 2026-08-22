@@ -74,6 +74,10 @@ pub struct DriftGroup {
 pub struct FingerprintReport {
     pub entries: Vec<ExchangeFingerprint>,
     pub drift_groups: Vec<DriftGroup>,
+    /// Optional human-facing annotation for surfaces without capture
+    /// sessions (proxy mode has no LLM-classified exchanges to report).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Classify one settled exchange into its wire-visible `llm` metadata block.
@@ -224,6 +228,7 @@ pub fn fingerprint_exchanges(
     FingerprintReport {
         entries,
         drift_groups,
+        note: None,
     }
 }
 
@@ -320,10 +325,17 @@ fn response_shape_fp(is_sse: bool, bytes: Option<&[u8]>) -> Option<String> {
             .filter_map(|event| serde_json::from_str(&event.data).ok())
             .collect();
         (!values.is_empty()).then(|| schema_fingerprint(&Value::Array(values)))
+    } else if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        Some(schema_fingerprint(&v))
     } else {
-        serde_json::from_slice::<Value>(bytes)
-            .ok()
-            .map(|v| schema_fingerprint(&v))
+        // NDJSON streaming (ollama-style): one JSON value per line. The
+        // shape fingerprint is the union of per-line shapes, so a stream
+        // with heterogeneous line shapes still gets a stable fp.
+        let values: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect();
+        (!values.is_empty()).then(|| schema_fingerprint(&Value::Array(values)))
     }
 }
 

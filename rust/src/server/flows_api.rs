@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures::future::BoxFuture;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
@@ -30,7 +30,7 @@ use crate::types::{
     BodyStorage, CaptureManifest, CaptureMode, CapturedBody, RedactionPolicySummary,
 };
 
-use crate::tui::feed::{summary_dto_from_session, FlowDetailDto, FlowSummaryDto};
+use crate::tui::feed::{summary_dto_from_session, BodyViewDto, FlowDetailDto, FlowSummaryDto};
 use crate::tui::filter::{SavedFilter, SavedFilterStore};
 
 /// Maximum `limit` accepted by `GET /__flows`.
@@ -61,8 +61,13 @@ pub trait FlowsBackend: Send + Sync + 'static {
     /// it existed.
     fn delete<'a>(&'a self, seq: u64) -> BoxFuture<'a, bool>;
 
-    /// Re-runs one recorded exchange against its target.
-    fn replay<'a>(&'a self, seq: u64) -> BoxFuture<'a, std::result::Result<ReplayOutcome, String>>;
+    /// Re-runs one recorded exchange against its target. The payload is
+    /// backend-shaped: capture sessions report a [`ReplayOutcome`] while the
+    /// HAR-backed proxy backend reports [`ProxyReplayOutcome`].
+    fn replay<'a>(
+        &'a self,
+        seq: u64,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>>;
 
     /// Aggregate LLM fingerprint report over the current snapshot.
     fn fingerprint_report<'a>(
@@ -146,11 +151,15 @@ impl FlowsBackend for SessionFlowsBackend {
         Box::pin(async move { self.session.remove_exchange(seq).await })
     }
 
-    fn replay<'a>(&'a self, seq: u64) -> BoxFuture<'a, std::result::Result<ReplayOutcome, String>> {
+    fn replay<'a>(
+        &'a self,
+        seq: u64,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
         Box::pin(async move {
-            replay_session_flow(&self.session, &self.target, seq)
+            let outcome = replay_session_flow(&self.session, &self.target, seq)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(outcome).map_err(|e| format!("serialize replay outcome: {e}"))
         })
     }
 
@@ -182,6 +191,249 @@ impl FlowsBackend for SessionFlowsBackend {
             .map_err(|e| format!("fingerprint task failed: {e}"))?;
             Ok(report)
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HAR-backed backend (proxy mode, FU-2)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a proxy-mode client replay: the upstream status the recorded
+/// request produced when re-sent, plus wall-clock duration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyReplayOutcome {
+    pub status: u16,
+    pub duration_ms: f64,
+}
+
+/// Note served by `GET /__fingerprint` in proxy mode, where only HAR entries
+/// (no capture session) exist to inspect.
+const PROXY_FINGERPRINT_NOTE: &str = "LLM fingerprinting requires a capture \
+session; proxy mode records HAR entries only. Run `arbiter tui` (embedded \
+capture) or fingerprint a saved bundle for classified LLM traffic.";
+
+/// Adapts the proxy-mode [`HarStore`] onto [`FlowsBackend`] so
+/// `arbiter tui --attach URL` works against `arbiter start` instances.
+///
+/// Sequences are **one-based** HAR entry positions (index + 1): the shared
+/// cursor protocol (`GET /__flows?after=N`, `CaptureSession::flow_summaries`)
+/// treats `after = 0` as "nothing seen yet", so a zero sequence could never
+/// be delivered. Deleting an entry shifts later entries (and therefore their
+/// sequences) down by one, mirroring plain vector deletion; attached TUIs
+/// absorb the renumbering on their next poll. Replays re-issue the recorded
+/// request against the configured target origin (client-replay semantics:
+/// no bundle is written, the recorded response is never compared).
+pub struct HarFlowsBackend {
+    har: Arc<crate::middleware::HarStore>,
+    target: Url,
+    client: reqwest::Client,
+}
+
+impl HarFlowsBackend {
+    pub fn new(har: Arc<crate::middleware::HarStore>, target: Url) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        Self {
+            har,
+            target,
+            client,
+        }
+    }
+
+    /// Maps a one-based sequence onto its HAR entry index.
+    fn index_of(seq: u64) -> Option<usize> {
+        usize::try_from(seq.checked_sub(1)?).ok()
+    }
+
+    /// Re-issues the recorded request at `seq` against the target origin.
+    async fn replay_entry(&self, seq: u64) -> std::result::Result<ProxyReplayOutcome, String> {
+        let entry = Self::index_of(seq)
+            .and_then(|index| self.har.entry(index))
+            .ok_or_else(|| format!("flow {seq} not found"))?;
+        let request = &entry["request"];
+        let method = request["method"].as_str().unwrap_or("GET");
+        let url = request["url"].as_str().unwrap_or("/");
+        let target_url = format!("{}{}", origin_of(&self.target), path_and_query(url));
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| format!("invalid replay method `{method}`: {e}"))?;
+        let mut builder = self.client.request(method, &target_url);
+        if let Some(headers) = request["headers"].as_array() {
+            for pair in headers {
+                let (Some(name), Some(value)) = (pair["name"].as_str(), pair["value"].as_str())
+                else {
+                    continue;
+                };
+                // Hop-by-hop and addressing headers are re-derived per hop.
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "host"
+                        | "content-length"
+                        | "connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                        | "proxy-connection"
+                ) {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
+        }
+        if let Some(text) = request["postData"]["text"].as_str() {
+            builder = builder.body(text.as_bytes().to_vec());
+        }
+        let started = std::time::Instant::now();
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| format!("replay request failed: {e}"))?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let status = response.status().as_u16();
+        // Drain the body so the connection returns to the pool.
+        let _ = response.bytes().await;
+        Ok(ProxyReplayOutcome {
+            status,
+            duration_ms,
+        })
+    }
+}
+impl FlowsBackend for HarFlowsBackend {
+    fn summaries_after<'a>(
+        &'a self,
+        after: u64,
+        limit: usize,
+    ) -> BoxFuture<'a, Vec<FlowSummaryDto>> {
+        Box::pin(async move {
+            // O(new entries): only entries past the cursor leave the lock.
+            // `seq > after` on one-based sequences == index >= after.
+            self.har
+                .entries_from(after as usize)
+                .into_iter()
+                .take(limit)
+                .map(|(index, entry)| summary_from_har(index as u64 + 1, &entry))
+                .collect()
+        })
+    }
+
+    fn latest_seq<'a>(&'a self) -> BoxFuture<'a, u64> {
+        Box::pin(async move { self.har.entry_count() as u64 })
+    }
+
+    fn detail<'a>(&'a self, seq: u64) -> BoxFuture<'a, Option<FlowDetailDto>> {
+        Box::pin(async move {
+            let index = Self::index_of(seq)?;
+            detail_from_har(seq, &self.har.entry(index)?)
+        })
+    }
+
+    fn delete<'a>(&'a self, seq: u64) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            Self::index_of(seq)
+                .map(|index| self.har.remove_entry(index))
+                .unwrap_or(false)
+        })
+    }
+
+    fn replay<'a>(
+        &'a self,
+        seq: u64,
+    ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
+        Box::pin(async move {
+            let outcome = self.replay_entry(seq).await?;
+            serde_json::to_value(outcome).map_err(|e| format!("serialize replay outcome: {e}"))
+        })
+    }
+
+    fn fingerprint_report<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, std::result::Result<crate::llm::FingerprintReport, String>> {
+        Box::pin(async move {
+            Ok(crate::llm::FingerprintReport {
+                entries: Vec::new(),
+                drift_groups: Vec::new(),
+                note: Some(PROXY_FINGERPRINT_NOTE.to_string()),
+            })
+        })
+    }
+}
+
+/// Projects one HAR entry into the shared list-row DTO. `seq` is the
+/// one-based entry position; provider/model columns are null (classification
+/// needs a capture session).
+fn summary_from_har(seq: u64, entry: &serde_json::Value) -> FlowSummaryDto {
+    let url = entry["request"]["url"].as_str().unwrap_or("/");
+    FlowSummaryDto {
+        sequence: seq,
+        started_at: entry["startedDateTime"]
+            .as_str()
+            .unwrap_or("1970-01-01T00:00:00.000Z")
+            .to_string(),
+        #[allow(dead_code)] // wire-contract field; proxy summaries omit it
+        method: entry["request"]["method"].as_str().unwrap_or("GET").to_string(),
+        path: path_and_query(url),
+        host: url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)),
+        status: entry["response"]["status"].as_u64().map(|s| s as u16),
+        duration_ms: entry["time"].as_f64(),
+        kind: "http".to_string(),
+        llm: None,
+    }
+}
+
+/// Builds the lazy detail view from `postData.text` / `content.text`.
+/// Truncation at [`DETAIL_BODY_TRUNCATE_BYTES`] with full `totalSize` is
+/// handled by [`BodyViewDto::from_bytes`].
+fn detail_from_har(seq: u64, entry: &serde_json::Value) -> Option<FlowDetailDto> {
+    let request = &entry["request"];
+    let response = &entry["response"];
+    let request_body = match request["postData"]["text"].as_str() {
+        Some(text) => {
+            BodyViewDto::from_bytes(text.as_bytes(), request["postData"]["mimeType"].as_str())
+        }
+        None => BodyViewDto::unavailable(),
+    };
+    let response_body = match response["content"]["text"].as_str() {
+        Some(text) => {
+            BodyViewDto::from_bytes(text.as_bytes(), response["content"]["mimeType"].as_str())
+        }
+        None => BodyViewDto::unavailable(),
+    };
+    Some(FlowDetailDto {
+        summary: summary_from_har(seq, entry),
+        request_headers: har_headers(&request["headers"]),
+        response_headers: har_headers(&response["headers"]),
+        request_body,
+        response_body,
+    })
+}
+
+/// Collects a HAR `[{name, value}]` header array into the wire header map.
+fn har_headers(value: &serde_json::Value) -> crate::types::HeaderMapValues {
+    let mut map = crate::types::HeaderMapValues::new();
+    let Some(pairs) = value.as_array() else {
+        return map;
+    };
+    for pair in pairs {
+        let (Some(name), Some(value)) = (pair["name"].as_str(), pair["value"].as_str()) else {
+            continue;
+        };
+        map.insert(name.to_string(), vec![value.to_string()]);
+    }
+    map
+}
+
+/// Path plus query of a recorded absolute URL (`/v1/messages?x=1`).
+fn path_and_query(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        },
+        Err(_) => url.to_string(),
     }
 }
 
@@ -574,10 +826,11 @@ mod tests {
         fn replay<'a>(
             &'a self,
             seq: u64,
-        ) -> BoxFuture<'a, std::result::Result<ReplayOutcome, String>> {
+        ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
             Box::pin(async move {
                 if self.find(seq).is_some() {
-                    Ok(ReplayOutcome::Match)
+                    serde_json::to_value(ReplayOutcome::Match)
+                        .map_err(|e| format!("serialize outcome: {e}"))
                 } else {
                     Err(format!("flow {seq} not found"))
                 }
@@ -773,5 +1026,281 @@ mod tests {
         #[allow(dead_code)]
         latest: u64,
         flows: Vec<FlowSummaryDto>,
+    }
+    // -----------------------------------------------------------------------
+    // Proxy mode (FU-2): HarStore-backed backend over loopback
+    // -----------------------------------------------------------------------
+
+    fn har_seed(
+        method: &str,
+        url: &str,
+        request_body: Option<&str>,
+        status: u16,
+        response_body: &[u8],
+    ) -> Value {
+        let mut request_headers = crate::types::HeaderMapValues::new();
+        request_headers.insert("content-type".to_string(), vec!["application/json".into()]);
+        request_headers.insert("host".to_string(), vec!["api.example.com".into()]);
+        request_headers.insert("x-api-key".to_string(), vec!["sk-test".into()]);
+        let mut response_headers = crate::types::HeaderMapValues::new();
+        response_headers.insert("content-type".to_string(), vec!["application/json".into()]);
+        let parts = crate::middleware::HarEntryParts {
+            started_at_ms: 1_755_840_000_000,
+            time_ms: 42,
+            method,
+            url: url.to_string(),
+            request_headers: &request_headers,
+            query_string: Vec::new(),
+            request_content_type: Some("application/json"),
+            request_body_text: request_body.map(String::from),
+            status,
+            response_headers: &response_headers,
+            response_body: Some(response_body),
+        };
+        crate::middleware::build_har_entry(&parts)
+    }
+
+    async fn spawn_har_app(entries: Vec<Value>, target: Url) -> String {
+        let har = Arc::new(crate::middleware::HarStore::new());
+        for entry in entries {
+            har.add_entry(entry);
+        }
+        let backend: Arc<dyn FlowsBackend> = Arc::new(HarFlowsBackend::new(har, target));
+        let app = router(FlowsApiState {
+            backend,
+            saved_filters: Arc::new(RwLock::new(
+                crate::tui::filter::InMemorySavedFilterStore::new(),
+            )),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve flows api");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_mode_serves_har_derived_flow_views() {
+        let target = Url::parse("http://localhost:9999").expect("target");
+        let base = spawn_har_app(
+            vec![
+                har_seed(
+                    "POST",
+                    "https://api.example.com/v1/messages?x=1",
+                    Some(r#"{"hi":true}"#),
+                    200,
+                    br#"{"ok":true}"#,
+                ),
+                har_seed(
+                    "GET",
+                    "https://api.example.com/v2/things",
+                    None,
+                    404,
+                    b"nope",
+                ),
+            ],
+            target,
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        // List rows carry the HAR projection (sequence = one-based entry
+        // position; `after=0` on the shared cursor means "nothing seen").
+        let page: Value = client
+            .get(format!("{base}/__flows"))
+            .send()
+            .await
+            .expect("list")
+            .json()
+            .await
+            .expect("list json");
+        assert_eq!(page["latest"], 2);
+        let flows = page["flows"].as_array().expect("flows array");
+        assert_eq!(flows.len(), 2);
+        assert_eq!(flows[0]["sequence"], 1);
+        assert_eq!(flows[0]["method"], "POST");
+        assert_eq!(flows[0]["path"], "/v1/messages?x=1");
+        assert_eq!(flows[0]["status"], 200);
+        assert_eq!(flows[0]["startedAt"], "2025-08-22T05:20:00.000Z");
+        assert_eq!(flows[0]["durationMs"].as_f64(), Some(42.0));
+
+        assert!(flows[0].get("llm").is_none());
+        // Detail views resolve bodies from postData/content text.
+        let detail: Value = client
+            .get(format!("{base}/__flows/1"))
+            .send()
+            .await
+            .expect("detail")
+            .json()
+            .await
+            .expect("detail json");
+        assert_eq!(detail["requestBody"]["text"], r#"{"hi":true}"#);
+        assert_eq!(detail["responseBody"]["totalSize"], 11);
+        assert_eq!(
+            detail["responseHeaders"]["content-type"][0],
+            "application/json"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_mode_detail_truncates_large_bodies_with_total_size() {
+        let big = vec![b'a'; crate::tui::feed::DETAIL_BODY_TRUNCATE_BYTES + 1024];
+        let target = Url::parse("http://localhost:9999").expect("target");
+        let base = spawn_har_app(
+            vec![har_seed(
+                "GET",
+                "https://api.example.com/big",
+                None,
+                200,
+                &big,
+            )],
+            target,
+        )
+        .await;
+        let detail: FlowDetailDto = reqwest::get(format!("{base}/__flows/1"))
+            .await
+            .expect("detail")
+            .json()
+            .await
+            .expect("detail json");
+        assert!(detail.response_body.truncated);
+        assert_eq!(
+            detail.response_body.total_size,
+            big.len() as u64,
+            "totalSize must reflect the untruncated body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_mode_delete_removes_entry_and_shifts_indices() {
+        let target = Url::parse("http://localhost:9999").expect("target");
+        let base = spawn_har_app(
+            vec![
+                har_seed("GET", "https://api.example.com/one", None, 200, b"1"),
+                har_seed("GET", "https://api.example.com/two", None, 200, b"2"),
+            ],
+            target,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let removed = client
+            .delete(format!("{base}/__flows/1"))
+            .send()
+            .await
+            .expect("delete");
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+
+        // The deleted sequence is gone; the former entry 2 now answers at 1.
+        let missing = client
+            .delete(format!("{base}/__flows/2"))
+            .send()
+            .await
+            .expect("second delete");
+        let remaining = client
+            .get(format!("{base}/__flows/1"))
+            .send()
+            .await
+            .expect("get shifted");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let detail: Value = remaining.json().await.expect("detail json");
+        assert_eq!(detail["path"], "/two");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_mode_fingerprint_reports_capture_session_note() {
+        let target = Url::parse("http://localhost:9999").expect("target");
+        let base = spawn_har_app(
+            vec![har_seed("GET", "https://api.example.com/", None, 200, b"")],
+            target,
+        )
+        .await;
+        let report: Value = reqwest::get(format!("{base}/__fingerprint"))
+            .await
+            .expect("fingerprint")
+            .json()
+            .await
+            .expect("report json");
+        assert!(report["entries"].as_array().expect("entries").is_empty());
+        let note = report["note"].as_str().expect("note present");
+        assert!(
+            note.contains("capture session"),
+            "note explains the gap: {note}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_mode_replay_reissues_recorded_request_upstream() {
+        // Echo upstream capturing what actually arrived.
+        use std::sync::Mutex as StdMutex;
+        struct EchoState {
+            #[allow(dead_code)] // asserted via upstream echo payload path
+            method: String,
+            path: String,
+            body: Vec<u8>,
+            api_key_seen: bool,
+        }
+        let seen: Arc<StdMutex<Option<EchoState>>> = Arc::new(StdMutex::new(None));
+        let router_echo = {
+            let seen = Arc::clone(&seen);
+            axum::Router::new().route(
+                "/v1/messages",
+                axum::routing::post(
+                    async move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        *seen.lock().expect("echo lock") = Some(EchoState {
+                            method: "POST".to_string(),
+                            path: "/v1/messages".to_string(),
+                            body: body.to_vec(),
+                            api_key_seen: headers.contains_key("x-api-key"),
+                        });
+                        axum::Json(serde_json::json!({ "echo": true }))
+                    },
+                ),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo");
+        let upstream_addr = listener.local_addr().expect("echo addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router_echo)
+                .await
+                .expect("serve echo");
+        });
+        let target = Url::parse(&format!("http://{upstream_addr}")).expect("target");
+
+        let base = spawn_har_app(
+            vec![har_seed(
+                "POST",
+                "https://api.example.com/v1/messages?x=1",
+                Some(r#"{"prompt":"hi"}"#),
+                201,
+                br#"{"recorded":"response"}"#,
+            )],
+            target,
+        )
+        .await;
+
+        let outcome: Value = reqwest::Client::new()
+            .post(format!("{base}/__replay/1"))
+            .send()
+            .await
+            .expect("replay")
+            .json()
+            .await
+            .expect("replay json");
+        assert_eq!(outcome["outcome"]["status"], 200);
+        assert!(outcome["outcome"]["durationMs"].as_f64().is_some());
+
+        let state = seen.lock().expect("echo lock");
+        let state = state.as_ref().expect("upstream received the replay");
+        assert_eq!(state.path, "/v1/messages");
+        assert_eq!(state.body, br#"{"prompt":"hi"}"#);
+        assert!(
+            state.api_key_seen,
+            "recorded non-addressing headers are re-sent"
+        );
     }
 }

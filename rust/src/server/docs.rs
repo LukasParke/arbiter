@@ -21,11 +21,22 @@ use crate::storage::SqliteStore;
 use crate::store::OpenApiStore;
 
 /// State shared by the docs endpoints.
+///
+/// When `flows_enabled` is set (proxy-mode `start_servers`), this router
+/// also mounts the flows API (`/__flows*`, `/__replay/:seq`,
+/// `/__fingerprint`, `/__saved-filters`). On proxy mode those routes serve
+/// **HAR-derived views** over the recorded [`HarStore`] entries via
+/// [`crate::server::flows_api::HarFlowsBackend`] — no capture session is
+/// involved — so `arbiter tui --attach URL` works against a plain
+/// `arbiter start`. Capture-session deployments mount the same routes from
+/// their own assembly instead of through this flag.
 pub struct DocsShared {
     pub target: url::Url,
     pub openapi: Arc<OpenApiStore>,
     pub har: Arc<HarStore>,
     pub db: Option<Arc<SqliteStore>>,
+    /// Mounts the flows API on this docs app; proxy mode passes `true`.
+    pub flows_enabled: bool,
 }
 
 impl DocsShared {
@@ -35,20 +46,36 @@ impl DocsShared {
             openapi,
             har,
             db: None,
+            flows_enabled: false,
         }
     }
 }
 
 /// The axum app serving API documentation and exports.
 pub fn docs_router(shared: Arc<DocsShared>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/har", get(har_endpoint))
         .route("/traffic.jsonl", get(traffic_endpoint))
         .route("/openapi.json", get(openapi_json_endpoint))
         .route("/openapi.yaml", get(openapi_yaml_endpoint))
         .route("/docs", get(scalar_page))
         .route("/", get(home_page))
-        .with_state(shared)
+        .with_state(Arc::clone(&shared));
+    // Proxy mode mounts the HAR-backed flows API here so
+    // `arbiter tui --attach` works against a plain `arbiter start`.
+    if !shared.flows_enabled {
+        return app;
+    }
+    let state = crate::server::flows_api::FlowsApiState {
+        backend: Arc::new(crate::server::flows_api::HarFlowsBackend::new(
+            Arc::clone(&shared.har),
+            shared.target.clone(),
+        )),
+        saved_filters: Arc::new(tokio::sync::RwLock::new(
+            crate::tui::filter::InMemorySavedFilterStore::new(),
+        )),
+    };
+    app.merge(crate::server::flows_api::router(state))
 }
 
 /// Rebuilds a spec from persisted endpoint rows (the TS tempStore hydration).
@@ -357,5 +384,62 @@ mod tests {
         assert_eq!(line["path"], "/things");
         assert_eq!(line["response_status"], 200);
         assert_eq!(line["request_headers"]["content-type"], "application/json");
+    }
+    #[tokio::test]
+    async fn flows_flag_mounts_har_backed_routes() {
+        let target = url::Url::parse("http://localhost:3000").expect("target");
+        let make = |flows_enabled: bool| {
+            Arc::new(DocsShared {
+                target: target.clone(),
+                openapi: Arc::new(OpenApiStore::new()),
+                har: Arc::new(HarStore::new()),
+                db: None,
+                flows_enabled,
+            })
+        };
+        let client = reqwest::Client::new();
+
+        // Disabled (docs-only default): flows routes are not mounted.
+        let base = spawn_docs(make(false)).await;
+        let base = base.to_string().trim_end_matches('/').to_string();
+        let response = client
+            .get(format!("{base}/__flows"))
+            .send()
+            .await
+            .expect("404 probe");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Enabled (proxy mode): HAR-derived views answer on the same app.
+        let shared = make(true);
+        shared.har.add_entry(json!({
+            "startedDateTime": "2026-01-01T00:00:00.000Z",
+            "time": 7,
+            "request": {
+                "method": "GET",
+                "url": "http://localhost:3000/things",
+                "httpVersion": "HTTP/1.1",
+                "headers": [],
+                "queryString": [],
+            },
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/1.1",
+                "headers": [],
+                "content": { "size": 0, "mimeType": "application/json", "text": "" },
+            },
+        }));
+        let base = spawn_docs(shared).await;
+        let base = base.to_string().trim_end_matches('/').to_string();
+        let page: serde_json::Value = client
+            .get(format!("{base}/__flows"))
+            .send()
+            .await
+            .expect("flows list")
+            .json()
+            .await
+            .expect("flows json");
+        assert_eq!(page["latest"], 1);
+        assert_eq!(page["flows"][0]["path"], "/things");
     }
 }

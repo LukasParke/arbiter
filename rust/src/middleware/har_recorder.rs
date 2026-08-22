@@ -191,6 +191,38 @@ impl HarStore {
     pub fn entry_count(&self) -> usize {
         self.entries.lock().expect("har store poisoned").len()
     }
+    /// Clones the entries at indices `[start, len)` paired with their
+    /// index, so flows-API polling only pays for new entries (O(new)).
+    pub fn entries_from(&self, start: usize) -> Vec<(usize, Value)> {
+        self.entries
+            .lock()
+            .expect("har store poisoned")
+            .iter()
+            .enumerate()
+            .skip(start)
+            .map(|(index, entry)| (index, entry.clone()))
+            .collect()
+    }
+
+    /// Clones one entry by index.
+    pub fn entry(&self, index: usize) -> Option<Value> {
+        self.entries
+            .lock()
+            .expect("har store poisoned")
+            .get(index)
+            .cloned()
+    }
+
+    /// Removes the entry at `index`; true when it existed. Later entries
+    /// shift down one index, mirroring plain vector deletion.
+    pub fn remove_entry(&self, index: usize) -> bool {
+        let mut entries = self.entries.lock().expect("har store poisoned");
+        if index >= entries.len() {
+            return false;
+        }
+        entries.remove(index);
+        true
+    }
 }
 
 /// Process-wide HAR store, mirroring the TS module-level
@@ -405,5 +437,29 @@ mod tests {
         assert_eq!(global.entry_count(), 1);
         assert!(std::ptr::eq(har_store(), global));
         global.clear();
+    }
+
+    #[test]
+    fn indexed_accessors_and_remove_entry() {
+        let store = HarStore::new();
+        let req = headers(&[]);
+        let resp = headers(&[]);
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+
+        // Tail reads are index-paired and skip earlier entries.
+        let tail = store.entries_from(1);
+        assert_eq!(tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(store.entry(2).is_some());
+        assert!(store.entry(3).is_none());
+
+        // Removal reports existence and shifts later indices down.
+        assert!(store.remove_entry(1));
+        assert_eq!(store.entry_count(), 2);
+        assert!(store.entry(1).is_some(), "former index 2 shifted down");
+        assert!(store.entry(2).is_none());
+        let tail = store.entries_from(0);
+        assert_eq!(tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1]);
     }
 }

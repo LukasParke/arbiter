@@ -308,6 +308,9 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             openapi: Arc::clone(&openapi),
             har: Arc::clone(&har),
             db: db.clone(),
+            // Proxy mode serves HAR-derived flows views so
+            // `arbiter tui --attach` works against a plain `arbiter start`.
+            flows_enabled: true,
         });
         let (listener, port) = proxy::bind_listener(options.docs_port).await?;
         let task = spawn_listener("docs", listener, docs_router(shared), shutdown_rx.clone());
@@ -326,6 +329,7 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
         println!("\nDocumentation:");
         println!("  API Reference: http://127.0.0.1:{docs_port}/docs");
         println!("\nExports:");
+        println!("  Flows API: http://127.0.0.1:{docs_port}/__flows");
         println!("  HAR Export: http://127.0.0.1:{docs_port}/har");
         println!("  OpenAPI JSON: http://127.0.0.1:{docs_port}/openapi.json");
         println!("  OpenAPI YAML: http://127.0.0.1:{docs_port}/openapi.yaml");
