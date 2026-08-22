@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::types::{
     BodyStorage, CaptureFailure, CaptureManifest, CaptureMode, CapturedBody, CapturedExchange,
     CapturedHeaders, CapturedRequest, CapturedResponse, HeaderMapValues, RedactionPolicySummary,
-    StreamState, ValidationSummary, EXCHANGE_SCHEMA_VERSION,
+    StreamState, ValidationSummary, WsOpcode, WsStream, EXCHANGE_SCHEMA_VERSION,
 };
 
 /// Bounds applied before parsing/allocating untrusted input.
@@ -23,6 +23,12 @@ impl BundleLimits {
     pub const MAX_HEADER_VALUE_BYTES: usize = 64 * 1024;
     pub const MAX_STRING_BYTES: usize = 64 * 1024;
 }
+
+/// Hard bound on captured websocket messages per exchange (matches the
+/// recorder's `MAX_WS_MESSAGES_PER_STREAM`).
+const MAX_WS_MESSAGES: usize = 100_000;
+/// Close reason is UTF-8 and at most 128 bytes after validation.
+const MAX_WS_CLOSE_REASON_BYTES: usize = 128;
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64
@@ -560,6 +566,13 @@ pub fn validate_exchange(raw: &Value, index: usize) -> Result<CapturedExchange, 
         &format!("{location}.sequence"),
         u64::MAX as f64,
     )?;
+    let tunnel = as_optional_ext(e, "tunnel", &format!("{location}.tunnel"))?;
+    let tls = as_optional_ext(e, "tls", &format!("{location}.tls"))?;
+    let ws: Option<WsStream> = as_optional_ext(e, "ws", &format!("{location}.ws"))?;
+    if let Some(ws) = &ws {
+        validate_ws_stream(ws, &format!("{location}.ws"))?;
+    }
+    let llm = as_optional_ext(e, "llm", &format!("{location}.llm"))?;
     Ok(CapturedExchange {
         schema_version: EXCHANGE_SCHEMA_VERSION,
         sequence,
@@ -573,12 +586,12 @@ pub fn validate_exchange(raw: &Value, index: usize) -> Result<CapturedExchange, 
         )?,
         request,
         response,
+        tls,
         failure,
         validation,
-        tunnel: as_optional_ext(e, "tunnel", &format!("{location}.tunnel"))?,
-        tls: as_optional_ext(e, "tls", &format!("{location}.tls"))?,
-        ws: as_optional_ext(e, "ws", &format!("{location}.ws"))?,
-        llm: as_optional_ext(e, "llm", &format!("{location}.llm"))?,
+        tunnel,
+        ws,
+        llm,
     })
 }
 
@@ -604,6 +617,113 @@ fn as_optional_ext<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Structural checks on a decoded WsStream that serde cannot express:
+/// bounded message count, per-message size/offset bounds, opcode/payload
+/// consistency, base64 validity, and close-reason length.
+fn validate_ws_stream(ws: &WsStream, location: &str) -> Result<(), Error> {
+    if ws.messages.len() > MAX_WS_MESSAGES {
+        return Err(fail(
+            &format!("{location}.messages"),
+            format!("more than {MAX_WS_MESSAGES} messages"),
+        ));
+    }
+    if let Some(protocol) = &ws.protocol {
+        if protocol.len() > BundleLimits::MAX_STRING_BYTES {
+            return Err(fail(
+                &format!("{location}.protocol"),
+                "string exceeds 65536 bytes",
+            ));
+        }
+    }
+    for (index, message) in ws.messages.iter().enumerate() {
+        let message_location = format!("{location}.messages[{index}]");
+        validate_ws_message(message, &message_location)?;
+    }
+    if let Some(reason) = &ws.close_reason {
+        if reason.len() > MAX_WS_CLOSE_REASON_BYTES {
+            return Err(fail(
+                &format!("{location}.closeReason"),
+                format!("exceeds {MAX_WS_CLOSE_REASON_BYTES} bytes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ws_message(message: &crate::types::WsMessage, location: &str) -> Result<(), Error> {
+    if message.size > BundleLimits::MAX_DECLARED_BODY_BYTES {
+        return Err(fail(
+            &format!("{location}.size"),
+            format!(
+                "out of bounds (0..{})",
+                BundleLimits::MAX_DECLARED_BODY_BYTES
+            ),
+        ));
+    }
+    if !message.offset_ms.is_finite() || message.offset_ms < 0.0 {
+        return Err(fail(
+            &format!("{location}.offsetMs"),
+            "expected a finite non-negative number",
+        ));
+    }
+    match message.opcode {
+        WsOpcode::Text => match (&message.text, &message.data_base64) {
+            (Some(text), None) => {
+                if text.len() as u64 != message.size {
+                    return Err(fail(
+                        &format!("{location}.size"),
+                        "does not match text length",
+                    ));
+                }
+            }
+            _ => {
+                return Err(fail(
+                    &format!("{location}.text"),
+                    "text messages carry text only",
+                ))
+            }
+        },
+        WsOpcode::Close => {
+            // Close frames may carry a reason, raw bytes, or nothing.
+            if let Some(data) = &message.data_base64 {
+                check_base64_payload(data, message.size, location)?;
+            } else if message.text.is_none() && message.size > 2 {
+                return Err(fail(
+                    &format!("{location}.size"),
+                    "empty close frame exceeds 2 bytes",
+                ));
+            }
+        }
+        WsOpcode::Binary | WsOpcode::Ping | WsOpcode::Pong => {
+            match (&message.data_base64, &message.text) {
+                (Some(data), None) => {
+                    check_base64_payload(data, message.size, location)?;
+                }
+                _ => {
+                    return Err(fail(
+                        &format!("{location}.dataBase64"),
+                        "expected dataBase64 payload for non-text opcode",
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_base64_payload(value: &str, size: u64, location: &str) -> Result<(), Error> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| fail(&format!("{location}.dataBase64"), "malformed base64"))?;
+    if decoded.len() as u64 != size {
+        return Err(fail(
+            &format!("{location}.size"),
+            "does not match decoded payload length",
+        ));
+    }
+    Ok(())
+}
 pub fn validate_sequence_order(exchanges: &[CapturedExchange]) -> Result<(), Error> {
     for pair in exchanges.windows(2) {
         if pair[1].sequence <= pair[0].sequence {
@@ -623,5 +743,150 @@ fn describe(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod ws_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    use base64::Engine;
+
+    /// Minimal valid HTTP-shaped exchange line, matching the writer's
+    /// canonical serialization.
+    fn base_exchange() -> Value {
+        let body = |value: &str| {
+            json!({
+                "sha256": sha256_hex_for(value),
+                "size": value.len(),
+                "mediaType": null,
+                "contentEncoding": null,
+                "storage": {"kind": "inline-base64", "value": base64_of(value)}
+            })
+        };
+        json!({
+            "schemaVersion": 1,
+            "sequence": 1,
+            "startedAt": "2026-08-21T00:00:00.000Z",
+            "durationMs": 5.0,
+            "request": {
+                "method": "GET", "path": "/x", "httpVersion": "1.1",
+                "headers": {"values": {}, "redacted": []}, "body": body("")
+            },
+            "response": {
+                "status": 200, "statusText": "OK", "httpVersion": "1.1",
+                "headers": {"values": {}, "redacted": []}, "body": body(""),
+                "stream": {"kind": "buffered", "completed": true,
+                           "clientAborted": false, "upstreamAborted": false,
+                           "terminalMarker": null, "error": null}
+            },
+            "failure": null, "validation": null,
+            "tunnel": null, "tls": null, "ws": null, "llm": null
+        })
+    }
+
+    fn sha256_hex_for(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(value.as_bytes()))
+    }
+
+    fn base64_of(value: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(value)
+    }
+
+    fn valid_ws_json() -> Value {
+        let payload = base64_of("hello");
+        json!({
+            "protocol": null,
+            "messages": [{
+                "direction": "client-to-server",
+                "opcode": "binary",
+                "dataBase64": payload,
+                "size": 5,
+                "offsetMs": 1.5
+            }],
+            "completed": true,
+            "closeCode": 1000,
+            "closeReason": "done"
+        })
+    }
+
+    fn exchange_with(ws: Value) -> Value {
+        let mut raw = base_exchange();
+        raw["ws"] = ws;
+        raw
+    }
+
+    #[test]
+    fn accepts_wellformed_ws_stream() {
+        let parsed = validate_exchange(&exchange_with(valid_ws_json()), 0).unwrap();
+        assert_eq!(parsed.ws.unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn rejects_excess_message_count() {
+        // Built structurally: 100_001 tiny messages would exceed the 8 MiB
+        let make = || crate::types::WsMessage {
+            direction: crate::types::WsDirection::ClientToServer,
+            opcode: crate::types::WsOpcode::Text,
+            text: Some(String::new()),
+            data_base64: None,
+            size: 0,
+            offset_ms: 0.0,
+        };
+        let ws = WsStream {
+            protocol: None,
+            messages: (0..=MAX_WS_MESSAGES).map(|_| make()).collect(),
+            completed: true,
+            close_code: None,
+            close_reason: None,
+        };
+        let err = validate_ws_stream(&ws, "exchange[0].ws").unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err}");
+
+        let at_cap = WsStream {
+            messages: (0..MAX_WS_MESSAGES).map(|_| make()).collect(),
+            ..ws
+        };
+        assert!(validate_ws_stream(&at_cap, "exchange[0].ws").is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_or_non_finite_offset() {
+        for bad in [-1.0, f64::NAN] {
+            let mut ws = valid_ws_json();
+            ws["messages"][0]["offsetMs"] = json!(bad);
+            // JSON cannot carry NaN; only the negative case is representable.
+            if !bad.is_nan() {
+                assert!(validate_exchange(&exchange_with(ws), 0).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_size_base64_mismatch() {
+        let mut ws = valid_ws_json();
+        ws["messages"][0]["size"] = json!(6);
+        assert!(validate_exchange(&exchange_with(ws), 0).is_err());
+    }
+
+    #[test]
+    fn rejects_text_opcode_without_text_payload() {
+        let mut ws = valid_ws_json();
+        ws["messages"][0]["opcode"] = json!("text");
+        ws["messages"][0]["text"] = Value::Null;
+        assert!(validate_exchange(&exchange_with(ws), 0).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_close_reason_and_bad_direction() {
+        let mut ws = valid_ws_json();
+        ws["closeReason"] = json!("x".repeat(129));
+        assert!(validate_exchange(&exchange_with(ws), 0).is_err());
+
+        let mut ws = valid_ws_json();
+        ws["messages"][0]["direction"] = json!("sideways");
+        assert!(validate_exchange(&exchange_with(ws), 0).is_err());
     }
 }

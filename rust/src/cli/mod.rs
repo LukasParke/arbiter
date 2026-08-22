@@ -5,16 +5,22 @@
 //! `Args` struct plus its dispatch logic.
 
 mod auth;
+mod ca;
 mod capture;
+mod complete;
+mod config_cmd;
 mod diff_cmd;
 mod discover;
+mod fingerprint;
 mod gateway;
 mod generate_spec;
 mod generate_traffic;
 mod infer_schemas;
+mod output;
 mod replay;
 mod sanitize;
 mod start;
+mod tui;
 mod validate;
 mod validate_schemas;
 use clap::{Args, FromArgMatches, Parser, Subcommand};

@@ -166,6 +166,16 @@ pub async fn replay_capture(bundle_dir: &Path, options: &ReplayOptions) -> Resul
 
     let exchanges: Vec<CapturedExchange> = source.exchanges().to_vec();
     let mut results = Vec::with_capacity(exchanges.len());
+    // Websocket conversations are not replayable over HTTP: fail loudly
+    // before any upstream request instead of silently replaying only the
+    // handshake. Status-only mode compares the recorded status and proceeds.
+    if options.mode != ReplayMode::StatusOnly {
+        if let Some(exchange) = exchanges.iter().find(|exchange| exchange.ws.is_some()) {
+            return Err(Error::WebsocketNotReplayable {
+                seq: exchange.sequence,
+            });
+        }
+    }
     for (index, exchange) in exchanges.iter().enumerate() {
         let outcome = try_replay_exchange(
             &mut source,
@@ -828,6 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn redacted_query_without_replacement_is_unreplayable() {
+        let _env_guard = crate::config::test_support::env_test_lock();
         let log: SharedLog = Arc::new(Mutex::new(Vec::new()));
         let seen = log.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -893,6 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_env_injects_header_upstream() {
+        let _env_guard = crate::config::test_support::env_test_lock();
         let seen: SharedLog = Arc::new(Mutex::new(Vec::new()));
         let auth_log = seen.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -971,6 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_secret_env_scans_bundle_before_replay() {
+        let _env_guard = crate::config::test_support::env_test_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app: axum::Router =
@@ -1206,5 +1219,66 @@ mod tests {
         assert_eq!(back.mode, ReplayMode::SemanticJsonResponse);
         assert_eq!(back.results[1].outcome, report.results[1].outcome);
         assert_eq!(back.diffed, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_bearing_exchange_fails_loudly_except_status_only() {
+        use crate::types::{WsDirection, WsMessage, WsOpcode, WsStream};
+
+        let seen: SharedLog = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: axum::Router = axum::Router::new().route(
+            "/x",
+            get(move || {
+                lock(&log).push("hit".into());
+                async move { StatusCode::OK }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut ws_exchange = recorded_exchange(1, "/x", "GET", b"", 200, b"ok", "buffered");
+        ws_exchange.ws = Some(WsStream {
+            protocol: None,
+            messages: vec![WsMessage {
+                direction: WsDirection::ClientToServer,
+                opcode: WsOpcode::Text,
+                text: Some("hi".into()),
+                data_base64: None,
+                size: 2,
+                offset_ms: 0.5,
+            }],
+            completed: true,
+            close_code: Some(1000),
+            close_reason: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = write_test_bundle(dir.path(), vec![ws_exchange]);
+        let target = Url::parse(&format!("http://{addr}")).unwrap();
+
+        // Body-comparing modes must refuse the exchange before any request.
+        for mode in [
+            ReplayMode::ExactResponseBody,
+            ReplayMode::SemanticJsonResponse,
+            ReplayMode::SemanticSseResponse,
+        ] {
+            let err = replay_capture(&bundle, &options_for(target.clone(), mode))
+                .await
+                .expect_err("ws exchange is not replayable");
+            assert!(
+                err.to_string().contains("WebSocket"),
+                "unexpected error: {err}"
+            );
+            assert!(lock(&seen).is_empty(), "no request may be sent");
+        }
+
+        // Status-only compares just the status and proceeds.
+        let report = replay_capture(&bundle, &options_for(target, ReplayMode::StatusOnly))
+            .await
+            .unwrap();
+        assert_eq!(report.matched, 1);
     }
 }

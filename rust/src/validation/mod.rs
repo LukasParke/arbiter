@@ -22,6 +22,8 @@
 //! response call before any request behaves like the TS unmatched-path case:
 //! no violations.
 
+pub mod violations;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -34,6 +36,7 @@ use serde_json::{json, Value};
 
 use crate::bundle::load_bundle;
 use crate::error::{Error, Result};
+use crate::mock::example::load_spec_document;
 use crate::types::{CapturedExchange, HeaderMapValues};
 
 const EXTERNAL_VALIDATOR_TIMEOUT_MS: u64 = 60_000;
@@ -94,7 +97,7 @@ pub struct ValidationReport {
 /// Any bundle read failure (digest mismatch, containment check, ...) fails
 /// closed as an [`Error`].
 pub async fn validate_capture(bundle_dir: &Path, spec_source: &Path) -> Result<ValidationReport> {
-    let spec = load_spec(spec_source)?;
+    let spec = load_spec_document(spec_source)?;
     let mut bundle = load_bundle(bundle_dir)?;
     let validator = BasicOpenApiValidator::new(spec);
     let mut violations = Vec::new();
@@ -250,25 +253,6 @@ fn violation_from_json(value: &Value) -> Option<Violation> {
             .unwrap_or("error")
             .to_string(),
     })
-}
-
-fn load_spec(path: &Path) -> Result<Value> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| Error::io(format!("read spec {}", path.display()), e))?;
-    let lower = path.to_string_lossy().to_lowercase();
-    if lower.ends_with(".yaml") || lower.ends_with(".yml") {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw)
-            .map_err(|e| Error::other(format!("invalid YAML spec {}: {e}", path.display())))?;
-        serde_json::to_value(yaml).map_err(|e| Error::Json {
-            context: format!("convert YAML spec {} to JSON", path.display()),
-            source: e,
-        })
-    } else {
-        serde_json::from_str(&raw).map_err(|e| Error::Json {
-            context: format!("spec {} is not valid JSON", path.display()),
-            source: e,
-        })
-    }
 }
 
 /// Lightweight OpenAPI validator over a parsed spec document. Checks known
@@ -596,28 +580,29 @@ fn template_matches(segments: &[Segment], incoming: &str) -> bool {
         })
 }
 
-impl ContractValidator for BasicOpenApiValidator {
-    fn validate_request(
+impl BasicOpenApiValidator {
+    /// Stateless request check: returns the spec match (spec path + method)
+    /// alongside violations WITHOUT remembering it, unlike
+    /// [`ContractValidator::validate_request`]. Live proxy validation uses
+    /// this to pair request/response by exchange sequence under any
+    /// interleaving.
+    pub(crate) fn check_request(
         &self,
         method: &str,
-        path: &str,
+        path_with_query: &str,
         headers: &HeaderMapValues,
-        _body: Option<&[u8]>,
-    ) -> Vec<Violation> {
-        let pathname = path.split('?').next().unwrap_or(path);
-        let query = query_record(path);
+    ) -> (Option<(String, String)>, Vec<Violation>) {
+        let pathname = path_with_query.split('?').next().unwrap_or(path_with_query);
+        let query = query_record(path_with_query);
         let first_header_values = first_values(headers);
-        let (matched, violations) =
-            self.validate_request_inner(method, pathname, &query, &first_header_values);
-        *self
-            .last_match
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = matched;
-        violations
+        self.validate_request_inner(method, pathname, &query, &first_header_values)
     }
 
-    fn validate_response(
+    /// Stateless response check for an explicitly supplied request match.
+    pub(crate) fn check_response(
         &self,
+        spec_path: &str,
+        method: &str,
         status: u16,
         headers: &HeaderMapValues,
         body: Option<&[u8]>,
@@ -633,18 +618,40 @@ impl ContractValidator for BasicOpenApiValidator {
         } else {
             parse_analysis_json(content_type, body)
         };
+        self.validate_response_inner(spec_path, method, status, content_type, parsed.as_ref())
+    }
+}
+
+impl ContractValidator for BasicOpenApiValidator {
+    fn validate_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &HeaderMapValues,
+        _body: Option<&[u8]>,
+    ) -> Vec<Violation> {
+        let (matched, violations) = self.check_request(method, path, headers);
+        *self
+            .last_match
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = matched;
+        violations
+    }
+
+    fn validate_response(
+        &self,
+        status: u16,
+        headers: &HeaderMapValues,
+        body: Option<&[u8]>,
+    ) -> Vec<Violation> {
         let last = self
             .last_match
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match last.as_ref() {
-            Some((spec_path, method)) => self.validate_response_inner(
-                spec_path,
-                method,
-                status,
-                content_type,
-                parsed.as_ref(),
-            ),
+            Some((spec_path, method)) => {
+                self.check_response(spec_path, method, status, headers, body)
+            }
             // Unmatched/unattempted request: same as the TS unmatched-path
             // early return.
             None => Vec::new(),

@@ -696,6 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_command_consumes_env_printing_stdout() {
+        let _env_guard = crate::config::test_support::env_test_lock();
         std::env::set_var("ARBITER_GATEWAY_TEST_SECRET", "env-secret-value");
         let upstream = spawn_echo_upstream().await;
         let server = start_test_gateway(

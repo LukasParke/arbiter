@@ -1,17 +1,31 @@
 //! Proxy + docs server lifecycle (port of `src/server.ts` `startServers`).
+//!
+//! Both listeners are served through hyper-util's **auto** connection
+//! builder with HTTP/1.1 AND HTTP/2 enabled, so ALPN-negotiated h2 works
+//! once a TLS acceptor is attached (W1) and h2c prior-knowledge clients are
+//! served on plaintext too. Connections accept protocol upgrades
+//! (`serve_connection_with_upgrades`), which WebSocket proxying relies on.
 
+pub mod connect;
 pub mod docs;
+pub mod flows_api;
+pub mod intercept;
 pub mod proxy;
+pub mod tls_downstream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use futures::future::BoxFuture;
 
 use crate::error::{Error, Result};
 use crate::middleware::HarStore;
 use crate::storage::SqliteStore;
 use crate::store::OpenApiStore;
+use futures::future::BoxFuture;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use tokio::sync::watch;
+use tower::Service;
 
 pub use docs::{docs_router, DocsShared};
 pub use proxy::{proxy_router, ProxyShared};
@@ -54,6 +68,58 @@ pub struct RunningServers {
     pub shutdown: BoxFuture<'static, ()>,
 }
 
+/// Serve `router` on `listener` over HTTP/1.1 AND HTTP/2 via hyper-util's
+/// auto connection builder (per-connection protocol detection; ALPN-selected
+/// h2 arrives with the W1 TLS acceptor). Upgrades (WebSocket) are supported.
+/// The returned task ends when `shutdown` fires; in-flight connections are
+/// aborted with it, matching the previous abrupt-shutdown semantics.
+fn spawn_listener(
+    name: &'static str,
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    mut shutdown: watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let builder = Builder::new(TokioExecutor::new());
+        let connections: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        let io = TokioIo::new(stream);
+                        let router = router.clone();
+                        let builder = builder.clone();
+                        let connections = Arc::clone(&connections);
+                        let handle = tokio::spawn(async move {
+                            let service = service_fn(move |req| {
+                                let mut router = router.clone();
+                                async move { router.call(req).await }
+                            });
+                            if let Err(err) =
+                                builder.serve_connection_with_upgrades(io, service).await
+                            {
+                                eprintln!("{name} connection error: {err}");
+                            }
+                        });
+                        let mut open = connections.lock().expect("connection registry");
+                        open.retain(|handle| !handle.is_finished());
+                        open.push(handle);
+                    }
+                    Err(err) => {
+                        eprintln!("{name} accept error: {err}");
+                        break;
+                    }
+                }
+            }
+        }
+        for handle in connections.lock().expect("connection registry").drain(..) {
+            handle.abort();
+        }
+    })
+}
+
 /// Sets up and starts the proxy and/or docs servers.
 ///
 /// Both apps share one [`OpenApiStore`] and one [`HarStore`]; when
@@ -61,6 +127,7 @@ pub struct RunningServers {
 /// and new traffic is persisted best-effort (failures never break
 /// proxying). Ports walk forward to the next free port on collision, like
 /// the TS `findAvailablePort`.
+
 pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
     if options.docs_only && options.proxy_only {
         return Err(Error::other(
@@ -96,7 +163,7 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             }
         }
     }
-
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
     let (proxy_handle, proxy_port) = if !options.docs_only {
         let shared = Arc::new(ProxyShared {
             target: options.target.clone(),
@@ -107,11 +174,7 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             verbose: options.verbose,
         });
         let (listener, port) = proxy::bind_listener(options.port).await?;
-        let task = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, proxy_router(shared)).await {
-                eprintln!("Proxy server error: {e}");
-            }
-        });
+        let task = spawn_listener("proxy", listener, proxy_router(shared), shutdown_rx.clone());
         (Some(task), port)
     } else {
         (None, options.port)
@@ -125,11 +188,7 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             db: db.clone(),
         });
         let (listener, port) = proxy::bind_listener(options.docs_port).await?;
-        let task = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, docs_router(shared)).await {
-                eprintln!("Docs server error: {e}");
-            }
-        });
+        let task = spawn_listener("docs", listener, docs_router(shared), shutdown_rx.clone());
         (Some(task), port)
     } else {
         (None, options.docs_port)
@@ -154,13 +213,13 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
         .map_err(|e| Error::other(format!("invalid proxy url: {e}")))?;
     let docs_url = url::Url::parse(&format!("http://127.0.0.1:{docs_port}"))
         .map_err(|e| Error::other(format!("invalid docs url: {e}")))?;
-
     let shutdown: BoxFuture<'static, ()> = Box::pin(async move {
+        let _ = shutdown_tx.send(());
         if let Some(handle) = proxy_handle {
-            handle.abort();
+            let _ = handle.await;
         }
         if let Some(handle) = docs_handle {
-            handle.abort();
+            let _ = handle.await;
         }
     });
 

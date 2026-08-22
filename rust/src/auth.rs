@@ -397,6 +397,7 @@ mod tests {
 
     #[test]
     fn save_to_disk_persists_and_reload_matches() {
+        let _env_guard = crate::config::test_support::env_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Point HOME at the tempdir for the duration of this test.
         let previous = std::env::var("HOME").ok();

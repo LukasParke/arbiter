@@ -10,7 +10,12 @@ use std::io::Read;
 use regex::Regex;
 
 use crate::error::{Error, Result, SecretFindingError};
-use crate::types::{BodyStorage, CapturedBody, CapturedExchange};
+use crate::types::{BodyStorage, CapturedBody, CapturedExchange, WsMessage};
+
+/// Per-message analysis-view cap for websocket binary payloads (decoded from
+/// `data_base64`). Larger payloads are reported as unscannable, fail-closed
+/// in exact mode.
+const MAX_WS_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretFinding {
@@ -175,9 +180,76 @@ pub fn scan_exchanges(
             &reject_values,
             &mut findings,
         );
+        if let Some(ws) = &exchange.ws {
+            for (index, message) in ws.messages.iter().enumerate() {
+                scan_ws_message(
+                    message,
+                    &format!("{prefix} ws message {index}"),
+                    &mut scan_text,
+                    &reject_values,
+                    &mut findings,
+                );
+            }
+        }
     }
 
     findings
+}
+
+/// Scan one captured websocket message: text payloads as text, binary
+/// payloads decoded from `data_base64` (bounded view) and scanned as
+/// lossy text so ASCII secret patterns are caught in either form.
+fn scan_ws_message(
+    message: &WsMessage,
+    location: &str,
+    mut scan_text: impl FnMut(&str, &str, &mut Vec<SecretFinding>),
+    reject_values: &[&String],
+    findings: &mut Vec<SecretFinding>,
+) {
+    if let Some(text) = &message.text {
+        scan_text(text, location, findings);
+        return;
+    }
+    let Some(data) = &message.data_base64 else {
+        return; // close frames without payload carry nothing to scan
+    };
+    let bytes = match base64_decode(data) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            findings.push(SecretFinding {
+                location: location.to_string(),
+                kind: "undecodable-ws-payload".into(),
+            });
+            return;
+        }
+    };
+    if bytes.len() > MAX_WS_SCAN_BYTES {
+        findings.push(SecretFinding {
+            location: location.to_string(),
+            kind: format!(
+                "unscannable-ws-binary (exceeds {} byte analysis view)",
+                MAX_WS_SCAN_BYTES
+            ),
+        });
+        return;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for value in reject_values {
+        if text.contains(value.as_str()) {
+            findings.push(SecretFinding {
+                location: location.to_string(),
+                kind: "caller-rejected-secret".into(),
+            });
+        }
+    }
+    for pattern in secret_patterns() {
+        if pattern.regex.is_match(&text) {
+            findings.push(SecretFinding {
+                location: location.to_string(),
+                kind: pattern.kind.into(),
+            });
+        }
+    }
 }
 
 fn scan_header_values(
@@ -537,5 +609,86 @@ mod tests {
         );
         assert_eq!(findings[0].kind, "jwt");
         assert_eq!(findings[0].location, "exchange 1 request headers (x-trace)");
+    }
+
+    #[test]
+    fn ws_text_and_binary_payloads_are_scanned() {
+        use base64::Engine;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let mut exchange = exchange(7, "/ws", inline_body(b"", None), inline_body(b"", None));
+        exchange.ws = Some(crate::types::WsStream {
+            protocol: None,
+            messages: vec![
+                // Text message carrying a known credential pattern.
+                crate::types::WsMessage {
+                    direction: crate::types::WsDirection::ClientToServer,
+                    opcode: crate::types::WsOpcode::Text,
+                    text: Some(format!("auth: sk-ant-{}", "a".repeat(20))),
+                    data_base64: None,
+                    size: 30,
+                    offset_ms: 0.0,
+                },
+                // Binary message with a caller-rejected secret planted inside.
+                crate::types::WsMessage {
+                    direction: crate::types::WsDirection::ServerToClient,
+                    opcode: crate::types::WsOpcode::Binary,
+                    text: None,
+                    data_base64: Some(encode(b"\x00\xffplanted-secret-marker\x01")),
+                    size: 23,
+                    offset_ms: 1.0,
+                },
+            ],
+            completed: true,
+            close_code: Some(1000),
+            close_reason: None,
+        });
+
+        let findings = scan_exchanges(
+            std::slice::from_ref(&exchange),
+            &HashMap::new(),
+            None,
+            &SecretScanOptions {
+                reject_secrets: vec!["planted-secret-marker".to_string()],
+                ..SecretScanOptions::default()
+            },
+        );
+
+        let text_finding = findings
+            .iter()
+            .find(|f| f.location == "exchange 7 ws message 0")
+            .expect("text ws payload scanned");
+        assert_eq!(text_finding.kind, "anthropic-api-key");
+        let binary_finding = findings
+            .iter()
+            .find(|f| f.location == "exchange 7 ws message 1")
+            .expect("binary ws payload scanned");
+        assert_eq!(binary_finding.kind, "caller-rejected-secret");
+        ensure_clean(findings).unwrap_err();
+    }
+
+    #[test]
+    fn ws_close_without_payload_yields_no_findings() {
+        let mut exchange = exchange(2, "/ws", inline_body(b"", None), inline_body(b"", None));
+        exchange.ws = Some(crate::types::WsStream {
+            protocol: None,
+            messages: vec![crate::types::WsMessage {
+                direction: crate::types::WsDirection::ServerToClient,
+                opcode: crate::types::WsOpcode::Close,
+                text: None,
+                data_base64: None,
+                size: 0,
+                offset_ms: 9.5,
+            }],
+            completed: true,
+            close_code: Some(1000),
+            close_reason: None,
+        });
+        let findings = scan_exchanges(
+            std::slice::from_ref(&exchange),
+            &HashMap::new(),
+            None,
+            &SecretScanOptions::default(),
+        );
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }

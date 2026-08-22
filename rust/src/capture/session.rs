@@ -39,10 +39,11 @@ use crate::secret_scan::{ensure_clean, scan_exchanges, SecretScanOptions};
 use crate::sse::SseParser;
 use crate::types::{
     BodyStorage, CaptureFailure, CaptureManifest, CaptureMode, CapturedBody, CapturedExchange,
-    CapturedRequest, CapturedResponse, HeaderMapValues, StreamState, ValidationSummary,
+    CapturedRequest, CapturedResponse, HeaderMapValues, StreamState, ValidationSummary, WsStream,
     BUNDLE_SCHEMA_VERSION, EXCHANGE_SCHEMA_VERSION,
 };
 use crate::version::ARBITER_VERSION;
+use crate::ws::{pump_ws, WsCaptureMeta};
 
 use super::body_sink::{BodyLimitPolicy, BodySink, DEFAULT_MAX_BODY_BYTES, MAX_SPILLED_BODY_BYTES};
 
@@ -112,6 +113,8 @@ struct SessionInner {
     idle: Notify,
     /// Exchange-count signal the idle-timeout watchdog resets its timer on.
     activity: watch::Sender<u64>,
+    /// Ticks the latest settled exchange sequence (AMEND-9 flow feed).
+    flow_seq: watch::Sender<u64>,
     client: reqwest::Client,
     inline_body_limit: u64,
 }
@@ -255,8 +258,8 @@ pub async fn start_capture_session(options: CaptureSessionOptions) -> Result<Cap
             options.target.scheme()
         )));
     }
-
     let (activity, _activity_rx) = watch::channel(0u64);
+    let (flow_seq, _flow_seq_rx) = watch::channel(0u64);
     let inner = Arc::new(SessionInner {
         target: options.target.clone(),
         mode: options.mode,
@@ -272,6 +275,7 @@ pub async fn start_capture_session(options: CaptureSessionOptions) -> Result<Cap
         in_flight: AtomicUsize::new(0),
         idle: Notify::new(),
         activity,
+        flow_seq,
         client: reqwest::Client::builder()
             // Node's http.request never auto-follows redirects; mirror that.
             .redirect(reqwest::redirect::Policy::none())
@@ -415,6 +419,79 @@ impl CaptureSession {
     pub async fn close(self) -> Result<()> {
         shutdown_and_export(&self.core, None).await
     }
+
+    /// Subscribes to the latest settled exchange sequence (AMEND-9). The
+    /// receiver ticks once per settled flow; initial value 0.
+    pub(crate) fn subscribe_flows(&self) -> watch::Receiver<u64> {
+        self.core.inner.flow_seq.subscribe()
+    }
+
+    /// Settled flows with sequence > `after_seq`, ascending, at most
+    /// `limit` entries. Cheap projection for live feeds (TUI, /__flows).
+    pub async fn flow_summaries(&self, after_seq: u64, limit: usize) -> Vec<FlowSummary> {
+        let exchanges = self.core.inner.exchanges.lock().expect("exchanges lock");
+        exchanges
+            .iter()
+            .filter(|exchange| exchange.sequence > after_seq)
+            .take(limit)
+            .map(|exchange| FlowSummary {
+                sequence: exchange.sequence,
+                method: exchange.request.method.clone(),
+                path: exchange.request.path.clone(),
+                status: exchange.response.status,
+                started_at: exchange.started_at.clone(),
+                duration_ms: exchange.duration_ms,
+                provider: exchange.llm.as_ref().map(|llm| llm.provider.clone()),
+                model: exchange.llm.as_ref().and_then(|llm| llm.model.clone()),
+            })
+            .collect()
+    }
+
+    /// Body bytes keyed by sha256 (blob payloads held in memory). Callers
+    /// resolve `CapturedBody.storage` references against this map.
+    pub async fn bodies_snapshot(&self) -> HashMap<String, Vec<u8>> {
+        self.core.inner.bodies_snapshot()
+    }
+
+    /// Removes a settled exchange from the live store so it never reaches a
+    /// bundle flush; also drops body bytes now referenced by nothing. Returns
+    /// false when `seq` was not found.
+    pub async fn remove_exchange(&self, seq: u64) -> bool {
+        let inner = &self.core.inner;
+        let removed = {
+            let mut exchanges = inner.exchanges.lock().expect("exchanges lock");
+            let before = exchanges.len();
+            exchanges.retain(|exchange| exchange.sequence != seq);
+            before != exchanges.len()
+        };
+        if !removed {
+            return false;
+        }
+        let mut bodies = inner.bodies.lock().expect("bodies lock");
+        let exchanges = inner.exchanges.lock().expect("exchanges lock");
+        bodies.retain(|digest, _| {
+            exchanges.iter().any(|exchange| {
+                exchange.request.body.sha256 == *digest || exchange.response.body.sha256 == *digest
+            })
+        });
+        let _ = inner.flow_seq.send(seq);
+        true
+    }
+}
+
+/// One settled flow projected for live consumers (TUI feed, /__flows).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowSummary {
+    pub sequence: u64,
+    pub method: String,
+    /// Redacted request path as stored.
+    pub path: String,
+    pub status: u16,
+    pub started_at: String,
+    pub duration_ms: f64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 async fn export_core(core: &SessionCore, options: Option<ExportOptions>) -> Result<ExportResult> {
@@ -514,6 +591,8 @@ struct ExchangeOutcome {
     stream: StreamState,
     failure: Option<CaptureFailure>,
     response_bytes: Vec<u8>,
+    /// Captured websocket stream for upgrade exchanges (None otherwise).
+    ws: Option<WsStream>,
 }
 
 fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
@@ -554,10 +633,10 @@ fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
                 stream: outcome.stream,
             },
             failure: outcome.failure.clone(),
+            ws: outcome.ws,
             validation: None,
             tunnel: None,
             tls: None,
-            ws: None,
             llm: None,
         };
         if let Some(hook) = &inner.validation {
@@ -577,6 +656,7 @@ fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
             .lock()
             .expect("exchanges lock")
             .push(exchange);
+        let _ = inner.flow_seq.send(outcome.seq);
         if let Some(failure) = &outcome.failure {
             inner.record_failure(failure.clone());
         }
@@ -639,6 +719,7 @@ fn upstream_failed_outcome(
             message,
         }),
         response_bytes: Vec::new(),
+        ws: None,
     }
 }
 
@@ -655,6 +736,12 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
     let http_version = version_string(req.version());
 
     inner.in_flight.fetch_add(1, Ordering::AcqRel);
+
+    // WebSocket upgrades bypass the body tee entirely: the handshake is
+    // forwarded upstream and the pump records the message stream instead.
+    if crate::ws::is_websocket_upgrade(req.headers()) {
+        return proxy_ws_upgrade(inner, req, seq, started_at_iso, started).await;
+    }
 
     let request_headers = from_http_header_map(req.headers());
     let mut upstream_headers = forwardable_headers(&request_headers, true);
@@ -722,6 +809,7 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
             },
             failure: Some(failure),
             response_bytes: Vec::new(),
+            ws: None,
         };
         return finish_upstream_failed(&inner, outcome).await;
     }
@@ -922,6 +1010,7 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
             },
             failure: response_failure,
             response_bytes,
+            ws: None,
         };
         finalize_exchange(&pump_inner, outcome);
         pump_inner.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -930,6 +1019,281 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
     });
 
     response
+}
+
+/// Proxy an RFC 6455 websocket upgrade: forward the handshake verbatim,
+/// mirror the upstream 101 to the client, then run the transparent capture
+/// pump until both legs end. Non-101 upstream answers fall back to a plain
+/// buffered exchange (no `ws` member). The exchange settles when the pump
+/// finishes.
+async fn proxy_ws_upgrade(
+    inner: Arc<SessionInner>,
+    mut req: Request,
+    seq: u64,
+    started_at_iso: String,
+    started: Instant,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let raw_path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let http_version = version_string(req.version());
+    let request_headers = from_http_header_map(req.headers());
+
+    // The pending client upgrade must be registered before the request body
+    // is consumed; hyper ties the upgraded IO to this request instance.
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    drop(req.into_body()); // upgrades carry no body
+
+    let mut upstream_headers = forwardable_headers(&request_headers, true);
+    // Hop-by-hop upgrade headers were stripped for plain HTTP; restore them
+    // so the upstream sees a real upgrade request.
+    upstream_headers.insert("connection".to_string(), vec!["Upgrade".to_string()]);
+    upstream_headers.insert("upgrade".to_string(), vec!["websocket".to_string()]);
+
+    let path_for_join = format!("/{}", raw_path.trim_start_matches('/'));
+    let upstream_url = match inner.target.join(&path_for_join) {
+        Ok(url) => url,
+        Err(err) => {
+            let outcome = ws_failure_outcome(
+                seq,
+                started_at_iso,
+                &started,
+                method,
+                raw_path,
+                http_version,
+                request_headers,
+                format!("invalid request path: {err}"),
+            );
+            return finish_upstream_failed(&inner, outcome).await;
+        }
+    };
+    let Ok(upstream_method) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+        inner.idle.notify_waiters();
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+
+    let request_builder =
+        inner
+            .client
+            .request(upstream_method, upstream_url)
+            .headers(to_http_header_map_with(&upstream_headers, |name| {
+                name == "host"
+            }));
+    let upstream_response = match request_builder.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            let outcome = ws_failure_outcome(
+                seq,
+                started_at_iso,
+                &started,
+                method,
+                raw_path,
+                http_version,
+                request_headers,
+                err.to_string(),
+            );
+            return finish_upstream_failed(&inner, outcome).await;
+        }
+    };
+
+    let status = upstream_response.status().as_u16();
+    let status_text = upstream_response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_string();
+    let response_headers = from_http_header_map(upstream_response.headers());
+
+    if status != 101 {
+        // Not an upgrade: relay as a plain buffered exchange with no ws
+        // member, exactly like an ordinary proxied response.
+        let (response_bytes, upstream_aborted) = match upstream_response.bytes().await {
+            Ok(bytes) => (bytes.to_vec(), false),
+            Err(_) => (Vec::new(), true),
+        };
+        let client_headers = forwardable_headers(&response_headers, false);
+        let mut builder = Response::builder().status(status);
+        for (name, value) in to_http_header_map(&client_headers) {
+            if let Some(name) = name {
+                builder = builder.header(name, value);
+            }
+        }
+        let response = builder
+            .body(Body::from(response_bytes.clone()))
+            .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        let outcome = ExchangeOutcome {
+            seq,
+            started_at_iso,
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            method,
+            raw_path,
+            http_version,
+            request_headers,
+            request_bytes: Vec::new(),
+            status,
+            status_text,
+            response_http_version: "1.1".to_string(),
+            response_headers,
+            stream: StreamState {
+                kind: "buffered".to_string(),
+                completed: !upstream_aborted,
+                client_aborted: false,
+                upstream_aborted,
+                terminal_marker: None,
+                error: None,
+            },
+            failure: None,
+            response_bytes,
+            ws: None,
+        };
+        finalize_exchange(&inner, outcome);
+        inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+        inner.idle.notify_waiters();
+        inner.mark_activity();
+        return response;
+    }
+
+    // 101: mirror the handshake to the client. The accept value forwarded by
+    // the upstream matches the client key we passed through verbatim.
+    let mut client_headers = forwardable_headers(&response_headers, false);
+    client_headers.insert("connection".to_string(), vec!["Upgrade".to_string()]);
+    client_headers.insert("upgrade".to_string(), vec!["websocket".to_string()]);
+    let meta = WsCaptureMeta {
+        protocol: first_header(&response_headers, "sec-websocket-protocol").map(str::to_string),
+        ..WsCaptureMeta::default()
+    };
+
+    let pump_inner = inner.clone();
+    tokio::spawn(async move {
+        let failure_stage = |message: String| -> ExchangeOutcome {
+            ws_failure_outcome(
+                seq,
+                started_at_iso.clone(),
+                &started,
+                method.clone(),
+                raw_path.clone(),
+                http_version.clone(),
+                request_headers.clone(),
+                message,
+            )
+        };
+
+        // Hold the upstream response until its upgraded IO resolves —
+        // dropping it early loses the connection (documented race).
+        let upstream_io = match upstream_response.upgrade().await {
+            Ok(io) => io,
+            Err(err) => {
+                let outcome = failure_stage(format!("upstream upgrade failed: {err}"));
+                finalize_exchange(&pump_inner, outcome);
+                pump_inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+                pump_inner.idle.notify_waiters();
+                pump_inner.mark_activity();
+                return;
+            }
+        };
+        let client_io = match tokio::time::timeout(Duration::from_secs(10), on_upgrade).await {
+            Ok(Ok(io)) => io,
+            _ => {
+                let outcome =
+                    failure_stage("client never completed the websocket upgrade".to_string());
+                finalize_exchange(&pump_inner, outcome);
+                pump_inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+                pump_inner.idle.notify_waiters();
+                pump_inner.mark_activity();
+                return;
+            }
+        };
+
+        // hyper's Upgraded speaks the futures IO traits; TokioIo adapts it
+        // for the tokio-trait pump. reqwest's upgraded side already does.
+        let result = pump_ws(hyper_util::rt::TokioIo::new(client_io), upstream_io, meta).await;
+        let outcome = ExchangeOutcome {
+            seq,
+            started_at_iso,
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            method,
+            raw_path,
+            http_version,
+            request_headers,
+            request_bytes: Vec::new(),
+            status: 101,
+            status_text: "Switching Protocols".to_string(),
+            response_http_version: "1.1".to_string(),
+            response_headers,
+            stream: StreamState {
+                kind: "websocket".to_string(),
+                completed: result.stream.completed,
+                client_aborted: result.client_aborted,
+                upstream_aborted: result.upstream_aborted,
+                terminal_marker: None,
+                error: result.error,
+            },
+            failure: None,
+            response_bytes: Vec::new(),
+            ws: Some(result.stream),
+        };
+        finalize_exchange(&pump_inner, outcome);
+        pump_inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+        pump_inner.idle.notify_waiters();
+        pump_inner.mark_activity();
+    });
+
+    let mut builder = Response::builder().status(101);
+    for (name, value) in to_http_header_map(&client_headers) {
+        if let Some(name) = name {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Failure variant for the websocket path: records the failed handshake as a
+/// 502 exchange with no ws member.
+#[allow(clippy::too_many_arguments)]
+fn ws_failure_outcome(
+    seq: u64,
+    started_at_iso: String,
+    started: &Instant,
+    method: String,
+    raw_path: String,
+    http_version: String,
+    request_headers: HeaderMapValues,
+    message: String,
+) -> ExchangeOutcome {
+    ExchangeOutcome {
+        seq,
+        started_at_iso,
+        duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+        method,
+        raw_path,
+        http_version,
+        request_headers,
+        request_bytes: Vec::new(),
+        status: 502,
+        status_text: "Bad Gateway".to_string(),
+        response_http_version: "1.1".to_string(),
+        response_headers: BTreeMap::new(),
+        stream: StreamState {
+            kind: "buffered".to_string(),
+            completed: false,
+            client_aborted: false,
+            upstream_aborted: true,
+            terminal_marker: None,
+            error: Some(message.clone()),
+        },
+        failure: Some(CaptureFailure {
+            stage: "upstream-connect".to_string(),
+            message,
+        }),
+        response_bytes: Vec::new(),
+        ws: None,
+    }
 }
 
 #[cfg(test)]
@@ -1229,5 +1593,192 @@ mod tests {
             .read_to_string(&mut manifest)
             .expect("manifest readable");
         assert!(manifest.contains("\"exchangeCount\":1"), "{manifest}");
+    }
+
+    /// Raw websocket echo fixture: echoes Text/Binary frames, answers Ping
+    /// with an explicit Pong, and completes close handshakes.
+    async fn spawn_ws_echo_upstream() -> Url {
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind ws fixture");
+        let address = listener.local_addr().expect("ws fixture address");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut ws = match accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                if ws.send(Message::Pong(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Message::Close(_) => {
+                                let _ = ws.close(None).await;
+                                break;
+                            }
+                            Message::Text(_) | Message::Binary(_) => {
+                                if ws.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        // The capture session proxies plain HTTP; the websocket upgrade is
+        // just a GET on this origin.
+        Url::parse(&format!("http://{address}")).expect("fixture URL")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_upgrade_captures_stream_and_relays() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let target = spawn_ws_echo_upstream().await;
+        let session = start_capture_session(CaptureSessionOptions {
+            target,
+            mode: CaptureMode::Observe,
+            ..CaptureSessionOptions::default()
+        })
+        .await
+        .expect("session starts");
+
+        // tungstenite requires the ws:// scheme on the client side.
+        let ws_url = session
+            .url()
+            .as_str()
+            .trim_end_matches('/')
+            .replacen("http://", "ws://", 1);
+        let (mut ws, response) = connect_async(format!("{ws_url}/socket"))
+            .await
+            .expect("upgrade succeeds");
+        assert_eq!(response.status(), 101);
+
+        ws.send(Message::text("hello")).await.expect("send text");
+        ws.send(Message::binary(b"\x00\x01binary!".to_vec()))
+            .await
+            .expect("send binary");
+        ws.send(Message::Ping(b"pingme".to_vec()))
+            .await
+            .expect("send ping");
+
+        // Drain echoed traffic until the terminal pong arrives.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_text = false;
+        let mut saw_binary = false;
+        let mut saw_pong = false;
+        while !(saw_text && saw_binary && saw_pong) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let frame = tokio::time::timeout(remaining, ws.next())
+                .await
+                .expect("echo within deadline")
+                .expect("stream open")
+                .expect("frame ok");
+            match frame {
+                Message::Text(text) if text.as_str() == "hello" => saw_text = true,
+                Message::Binary(data) if data.as_slice() == b"\x00\x01binary!" => {
+                    saw_binary = true;
+                }
+                Message::Pong(payload) if payload.as_slice() == b"pingme" => saw_pong = true,
+                _ => {}
+            }
+        }
+
+        // Clean client-initiated close; the pump must observe it as such.
+        let close_frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: 1000u16.into(),
+            reason: std::borrow::Cow::Borrowed("bye"),
+        };
+        ws.send(Message::Close(Some(close_frame)))
+            .await
+            .expect("send close");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        session.wait_for_idle().await;
+        let exchanges = session.exchanges().await;
+        let exchange = exchanges
+            .iter()
+            .find(|exchange| exchange.ws.is_some())
+            .expect("websocket exchange captured");
+        assert_eq!(exchange.response.status, 101);
+        assert_eq!(exchange.request.method, "GET");
+        assert_eq!(exchange.request.path, "/socket");
+        assert_eq!(exchange.response.stream.kind, "websocket");
+        // Tunnel/TLS metadata belongs to the tls wave, never this capture.
+        assert!(exchange.tunnel.is_none());
+        assert!(exchange.tls.is_none());
+
+        let stream = exchange.ws.as_ref().expect("ws present");
+        assert!(stream.completed);
+        assert_eq!(stream.close_code, Some(1000));
+        assert_eq!(stream.close_reason.as_deref(), Some("bye"));
+
+        let messages = &stream.messages;
+        // First observed frame is the client's text hello, relayed upstream.
+        assert_eq!(
+            messages[0].direction,
+            crate::types::WsDirection::ClientToServer
+        );
+        assert_eq!(messages[0].opcode, crate::types::WsOpcode::Text);
+        assert_eq!(messages[0].text.as_deref(), Some("hello"));
+        // Offsets are non-decreasing in arrival order.
+        for pair in messages.windows(2) {
+            assert!(pair[1].offset_ms >= pair[0].offset_ms);
+        }
+        // The binary round trip is recorded both directions with base64 data.
+        let binary_out = messages
+            .iter()
+            .find(|m| m.opcode == crate::types::WsOpcode::Binary)
+            .expect("client binary recorded");
+        assert_eq!(
+            binary_out.direction,
+            crate::types::WsDirection::ClientToServer
+        );
+        assert_eq!(
+            crate::secret_scan::base64_decode(binary_out.data_base64.as_deref().expect("base64"))
+                .expect("decodes"),
+            b"\x00\x01binary!".to_vec()
+        );
+        assert!(messages.iter().any(|m| {
+            m.direction == crate::types::WsDirection::ServerToClient
+                && m.opcode == crate::types::WsOpcode::Binary
+                && m.size == binary_out.size
+        }));
+        // Ping passthrough: exactly one client ping recorded, at least one
+        // pong observed from upstream.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.opcode == crate::types::WsOpcode::Ping)
+                .count(),
+            1
+        );
+        assert!(messages
+            .iter()
+            .any(|m| m.direction == crate::types::WsDirection::ServerToClient
+                && m.opcode == crate::types::WsOpcode::Pong));
+        // Close frame is recorded last with its direction preserved.
+        let close = messages.last().expect("non-empty stream").clone();
+        assert_eq!(close.opcode, crate::types::WsOpcode::Close);
+        assert_eq!(close.text.as_deref(), Some("bye"));
+        assert_eq!(close.direction, crate::types::WsDirection::ClientToServer);
+
+        session.close().await.expect("close");
     }
 }

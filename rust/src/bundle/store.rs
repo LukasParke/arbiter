@@ -122,20 +122,37 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// Digest over normalized exchange content. Timing provenance (`startedAt`,
-/// `durationMs`) is excluded so semantically identical captures compare equal.
+/// `durationMs`, and per-message `offsetMs` inside `ws.messages`) is excluded
+/// so semantically identical captures compare equal (AMEND-13). HTTP-only
+/// exchanges hash exactly as before this extension existed.
 pub fn bundle_digest(exchanges: &[CapturedExchange]) -> String {
     let mut hash = Sha256::new();
     for exchange in exchanges {
         let value = serde_json::to_value(exchange).expect("exchange serializes");
         if let Value::Object(map) = &value {
             let mut view = map.clone();
-            view.remove("startedAt");
-            view.remove("durationMs");
+            normalize_digest_view(&mut view);
             hash.update(stable_stringify(&Value::Object(view)));
         }
         hash.update(b"\n");
     }
     hex::encode(hash.finalize())
+}
+
+/// Strip-list applied before hashing: volatile timing fields only.
+/// Extension point for future v2 members that carry wall-clock data.
+fn normalize_digest_view(view: &mut serde_json::Map<String, Value>) {
+    view.remove("startedAt");
+    view.remove("durationMs");
+    if let Some(Value::Object(ws)) = view.get_mut("ws") {
+        if let Some(Value::Array(messages)) = ws.get_mut("messages") {
+            for message in messages.iter_mut() {
+                if let Value::Object(message) = message {
+                    message.remove("offsetMs");
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -732,5 +749,61 @@ mod tests {
                 .permissions(),
         );
         assert_eq!(manifest_mode & 0o777, 0o600);
+    }
+
+    // ---- AMEND-13 digest invariants ----
+
+    /// Golden value for this exact HTTP-only exchange. For `ws: None`
+    /// exchanges the offsetMs strip is a structural no-op, so the pre-change
+    /// strip-list ({startedAt, durationMs} only) and the current one hash
+    /// byte-identically — this pins the frozen TS interchange digest.
+    const HTTP_ONLY_DIGEST_GOLDEN: &str =
+        "2efab080269ff1d932b87e3635c17c42f083db908ab7547f7dfd692cb4c8ae3a";
+
+    fn http_only_golden_exchange() -> CapturedExchange {
+        let mut e = minimal_exchange(1, b"hello");
+        e.started_at = "2026-08-21T00:00:00.000Z".into();
+        e.duration_ms = 12.5;
+        e
+    }
+
+    #[test]
+    fn http_only_digest_matches_pre_change_golden() {
+        assert_eq!(
+            bundle_digest(&[http_only_golden_exchange()]),
+            HTTP_ONLY_DIGEST_GOLDEN
+        );
+    }
+
+    #[test]
+    fn digest_ignores_ws_offset_timing_but_not_content() {
+        use crate::types::{WsDirection, WsMessage, WsOpcode};
+
+        let message = |offset_ms: f64, text: &str| WsMessage {
+            direction: WsDirection::ClientToServer,
+            opcode: WsOpcode::Text,
+            text: Some(text.into()),
+            data_base64: None,
+            size: text.len() as u64,
+            offset_ms,
+        };
+        let mut with_ws = http_only_golden_exchange();
+        with_ws.ws = Some(crate::types::WsStream {
+            protocol: None,
+            messages: vec![message(1.0, "first"), message(2500.5, "second")],
+            completed: true,
+            close_code: Some(1000),
+            close_reason: Some("done".into()),
+        });
+
+        let mut repaced = with_ws.clone();
+        repaced.ws.as_mut().unwrap().messages[0].offset_ms = 3.25;
+        repaced.ws.as_mut().unwrap().messages[1].offset_ms = 9000.0;
+        // Timing-only differences hash identically...
+        assert_eq!(bundle_digest(&[with_ws.clone()]), bundle_digest(&[repaced]));
+        // ...but content differences do not (order flip).
+        let mut reordered = with_ws.clone();
+        reordered.ws.as_mut().unwrap().messages.reverse();
+        assert_ne!(bundle_digest(&[with_ws]), bundle_digest(&[reordered]));
     }
 }
