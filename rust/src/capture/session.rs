@@ -651,6 +651,19 @@ fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
                 .expect("validations lock")
                 .extend(violations);
         }
+        // W4: stamp the LLM provider fingerprint while the raw bytes are at
+        // hand. Resolver contract: request bytes followed by response bytes
+        // concatenated — the engine splits legs by recorded size + sha256.
+        // Non-LLM traffic stays None (field never serialized).
+        if exchange.llm.is_none() && outcome.failure.is_none() {
+            let request_bytes = outcome.request_bytes.clone();
+            let response_bytes = outcome.response_bytes.clone();
+            exchange.llm = crate::llm::fingerprint_exchange(&exchange, move |_| {
+                let mut joined = request_bytes.clone();
+                joined.extend_from_slice(&response_bytes);
+                Some(joined)
+            });
+        }
         inner
             .exchanges
             .lock()
@@ -1780,5 +1793,67 @@ mod tests {
         assert_eq!(close.direction, crate::types::WsDirection::ClientToServer);
 
         session.close().await.expect("close");
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_traffic_gets_llm_fingerprint_stamped() {
+        use axum::routing::post;
+        use axum::Json;
+
+        async fn messages(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(json!({
+                "id": "msg_1",
+                "model": body.get("model").cloned().unwrap_or_default(),
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 12, "output_tokens": 34},
+            }))
+        }
+
+        let app = axum::Router::new().route("/v1/messages", post(messages));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let session = start_capture_session(CaptureSessionOptions {
+            target: format!("http://{addr}").parse().unwrap(),
+            listen_host: "127.0.0.1".parse().unwrap(),
+            listen_port: 0,
+            mode: CaptureMode::Exact,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let proxy = session.url().to_string();
+        let proxy = proxy.trim_end_matches('/').to_string();
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{proxy}/v1/messages"))
+            .header("x-api-key", "sk-ant-test")
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        session.wait_for_idle().await;
+        let exchanges = session.exchanges().await;
+        assert_eq!(exchanges.len(), 1);
+        let llm = exchanges[0].llm.as_ref().expect("llm meta stamped");
+        assert_eq!(llm.provider, "anthropic");
+        assert_eq!(llm.model.as_deref(), Some("claude-sonnet-4"));
+        assert!(!llm.streaming); // fixture is non-streaming
+        assert_eq!(llm.prompt_tokens, Some(12));
+        assert_eq!(llm.completion_tokens, Some(34));
+        assert_eq!(llm.stop_reason.as_deref(), Some("end_turn"));
+        assert!(llm.request_shape_fp.is_some());
+
+        session.close().await.unwrap();
     }
 }
