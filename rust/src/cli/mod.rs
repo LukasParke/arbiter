@@ -116,9 +116,14 @@ pub fn run() -> ! {
     let verbose = ["start", "capture", "replay"]
         .iter()
         .find_map(|name| {
-            matches
-                .subcommand_matches(name)
-                .map(|m| m.get_flag("verbose"))
+            let m = matches.subcommand_matches(name)?;
+            // Not every subcommand defines --verbose; unknown ids are
+            // skipped, never panicked on.
+            if m.contains_id("verbose") {
+                Some(m.get_flag("verbose"))
+            } else {
+                None
+            }
         })
         .unwrap_or(false);
     crate::cli::output::init_tracing(verbose, json);

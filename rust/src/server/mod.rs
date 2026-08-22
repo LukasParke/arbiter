@@ -198,6 +198,7 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             fault: options.fault,
             header_rules: options.header_rules,
             hooks: options.hooks,
+            validate: options.validate,
         });
         let (listener, port) = proxy::bind_listener(options.port).await?;
         let task = spawn_listener("proxy", listener, proxy_router(shared), shutdown_rx.clone());

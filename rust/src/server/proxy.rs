@@ -58,6 +58,10 @@ pub struct ProxyShared {
     pub openapi: Arc<OpenApiStore>,
     pub har: Arc<HarStore>,
     pub policy: RedactionPolicy,
+    /// Subprocess/webhook hooks; `None` = disabled.
+    pub hooks: Option<HookConfig>,
+    /// Live OpenAPI validation; `None` = disabled (W7 `--validate-spec`).
+    pub validate: Option<std::sync::Arc<crate::validation::violations::LiveValidator>>,
     pub db: Option<Arc<SqliteStore>>,
     pub verbose: bool,
     /// TLS interception config; `Some` enables CONNECT MITM (M3a).
@@ -66,8 +70,6 @@ pub struct ProxyShared {
     pub fault: Option<FaultInjector>,
     /// Ordered header rewrite rules: (request-direction, response-direction).
     pub header_rules: Option<(HeaderRuleSet, HeaderRuleSet)>,
-    /// Subprocess/webhook hooks; `None` = disabled.
-    pub hooks: Option<HookConfig>,
 }
 
 impl ProxyShared {
@@ -78,8 +80,8 @@ impl ProxyShared {
 
     pub fn new(target: url::Url) -> Self {
         Self {
-            next_seq: std::sync::atomic::AtomicU64::new(0),
             target,
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             openapi: Arc::new(OpenApiStore::new()),
             har: Arc::new(HarStore::new()),
             policy: RedactionPolicy::default(),
@@ -89,6 +91,7 @@ impl ProxyShared {
             fault: None,
             header_rules: None,
             hooks: None,
+            validate: None,
         }
     }
 }
@@ -242,6 +245,7 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
                                 h.insert("content-type".into(), vec![ct]);
                                 h
                             },
+                            validation_seq: 0,
                         },
                         &b,
                     );
@@ -296,6 +300,28 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
     if let Some((request_rules, _)) = &shared.header_rules {
         request_rules.apply(&mut request_headers);
     }
+
+    // Live OpenAPI validation, request leg (W7). Runs on the final forwarded
+    // headers/body; the paired response leg happens inside record_exchange.
+    // Violations are recorded best-effort and never alter the traffic.
+    let validation_seq = if shared.validate.is_some() {
+        let seq = shared.next_sequence();
+        let validator = shared.validate.as_ref().expect("checked above");
+        let violations = validator.validate_request_parts(
+            seq,
+            method.as_str(),
+            &path_and_query,
+            &raw_query,
+            &request_headers,
+            Some(&request_body),
+        );
+        if !violations.is_empty() {
+            validator.collector.record(seq, violations);
+        }
+        seq
+    } else {
+        0
+    };
 
     // Forward end-to-end headers only; the client re-computes framing and
     // derives Host from the upstream URL (changeOrigin semantics).
@@ -356,6 +382,7 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
                     request_body,
                     status: status.as_u16(),
                     response_headers,
+                    validation_seq,
                 },
                 passthrough_headers,
             )
@@ -376,6 +403,7 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
             request_body,
             status: status.as_u16(),
             response_headers,
+            validation_seq,
         },
         passthrough_headers,
         status,
@@ -811,11 +839,35 @@ struct RecordMeta {
     request_body: axum::body::Bytes,
     status: u16,
     response_headers: HeaderMapValues,
+    /// Sequence used to pair the request-leg validation match with its
+    /// response leg in `LiveValidator`'s pending map (`0` = not validated,
+    /// e.g. fault-short-circuited exchanges).
+    validation_seq: u64,
 }
 
 /// Background recording: HAR entry, OpenAPI endpoint, and optional SQLite
 /// persistence — all best-effort, never failing the proxied exchange.
 fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8]) {
+    // Live OpenAPI validation, response leg (W7). Runs inside the same
+    // blocking task as recording, on the settled (post-hook) body. `seq == 0`
+    // marks exchanges that never ran the request leg (fault short-circuit);
+    // the pending lookup then behaves like unmatched-path: no violations.
+    if let Some(validator) = &shared.validate {
+        if meta.validation_seq != 0 {
+            let violations = validator.validate_response_parts(
+                meta.validation_seq,
+                meta.status,
+                &meta.response_headers,
+                Some(&response_body),
+            );
+            if !violations.is_empty() {
+                validator
+                    .collector
+                    .record(meta.validation_seq, violations);
+            }
+        }
+    }
+
     let response_content_type = first_value(&meta.response_headers, "content-type")
         .unwrap_or_default()
         .to_string();
