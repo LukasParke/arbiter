@@ -6,6 +6,8 @@
 
 Arbiter is a powerful API proxy and documentation generator that automatically creates OpenAPI specifications and HAR (HTTP Archive) recordings for any API you access through it.
 
+> **Rust port:** a full Rust implementation of Arbiter is being staged for review in [`rust/`](./rust) (see the [Rust README](./rust/README.md)). The TypeScript implementation below remains the published package until cutover is approved.
+
 ## Features
 
 - **Exact Capture** - Byte-fidelity capture of application HTTP bodies with deterministic, content-addressed capture bundles
