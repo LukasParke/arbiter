@@ -137,7 +137,15 @@ impl CaptureMock {
             let mut rule = p.rule;
             if let Some(body_meta) = p.request_body {
                 let req_bytes = bundle.read_body(&body_meta)?;
-                if !req_bytes.is_empty() {
+                // Body predicates are text-only: a lossy conversion would
+                // replace invalid bytes with U+FFFD, producing a needle that
+                // can never occur on the wire and making the stub
+                // permanently unmatchable (binary/gzip/protobuf bodies).
+                // Binary bodies still match on method+path+query+content-type.
+                if !req_bytes.is_empty()
+                    && std::str::from_utf8(&req_bytes[..req_bytes.len().min(BODY_PREDICATE_PREFIX)])
+                        .is_ok()
+                {
                     let prefix_len = req_bytes.len().min(BODY_PREDICATE_PREFIX);
                     rule.predicates.push(RequestPredicate::BodyContains(
                         String::from_utf8_lossy(&req_bytes[..prefix_len]).into_owned(),

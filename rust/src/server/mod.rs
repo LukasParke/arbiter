@@ -59,6 +59,9 @@ pub struct ServerOptions {
     /// Live OpenAPI validation over proxied traffic; `None` = disabled
     /// (W7 seam for `--validate-spec`; consumed by the proxy pipeline).
     pub validate: Option<Arc<crate::validation::violations::LiveValidator>>,
+    /// Reverse-proxy downstream TLS identity (`--tls-cert/--tls-key`);
+    /// `Some` serves the proxy listener over HTTPS directly.
+    pub downstream_tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 impl Default for ServerOptions {
@@ -76,6 +79,7 @@ impl Default for ServerOptions {
             header_rules: None,
             hooks: None,
             validate: None,
+            downstream_tls: None,
         }
     }
 }
@@ -98,6 +102,71 @@ fn spawn_listener(
     name: &'static str,
     listener: tokio::net::TcpListener,
     router: axum::Router,
+    shutdown: watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_listener_tls(name, listener, None, router, shutdown)
+}
+
+/// Like [`spawn_listener`] but optionally wrapping each accepted stream in a
+/// rustls TLS server session (reverse-proxy downstream HTTPS, W1).
+/// Erased proxy connection IO: plain TCP or rustls-wrapped (W1 downstream).
+#[allow(clippy::large_enum_variant)] // per-connection value; size is transient
+enum ProxyIo {
+    Plain(tokio::net::TcpStream),
+    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+impl tokio::io::AsyncRead for ProxyIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyIo::Plain(io) => std::pin::Pin::new(io).poll_read(cx, buf),
+            ProxyIo::Tls(io) => std::pin::Pin::new(io).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ProxyIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            ProxyIo::Plain(io) => std::pin::Pin::new(io).poll_write(cx, buf),
+            ProxyIo::Tls(io) => std::pin::Pin::new(io).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyIo::Plain(io) => std::pin::Pin::new(io).poll_flush(cx),
+            ProxyIo::Tls(io) => std::pin::Pin::new(io).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyIo::Plain(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+            ProxyIo::Tls(io) => std::pin::Pin::new(io).poll_shutdown(cx),
+        }
+    }
+}
+
+fn spawn_listener_tls(
+    name: &'static str,
+    listener: tokio::net::TcpListener,
+    tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+    router: axum::Router,
     mut shutdown: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -109,7 +178,21 @@ fn spawn_listener(
                 _ = shutdown.changed() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        let io = TokioIo::new(stream);
+                        let io = match &tls_config {
+                            Some(config) => {
+                                let acceptor =
+                                    tokio_rustls::TlsAcceptor::from(Arc::clone(config));
+                                match acceptor.accept(stream).await {
+                                    Ok(t) => ProxyIo::Tls(t),
+                                    Err(e) => {
+                                        eprintln!("{name}: TLS handshake failed: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => ProxyIo::Plain(stream),
+                        };
+                        let io = TokioIo::new(io);
                         let router = router.clone();
                         let builder = builder.clone();
                         let connections = Arc::clone(&connections);
@@ -175,13 +258,20 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
     let openapi = Arc::new(OpenApiStore::new());
     let har = Arc::new(HarStore::new());
 
-    // Hydrate the OpenAPI store with persisted endpoints.
+    // Hydrate the OpenAPI store with persisted endpoints. Sync sqlite reads
+    // plus schema inference run on the blocking pool so a soak-sized table
+    // never delays the listening sockets.
     if let Some(db) = &db {
-        if let Ok(persisted) = db.get_all_endpoints() {
-            for (path, method, data) in persisted {
+        let db = Arc::clone(db);
+        let openapi = Arc::clone(&openapi);
+        tokio::task::spawn_blocking(move || {
+            let Ok(persisted) = db.get_all_endpoints() else {
+                return;
+            };
+            for (path, method, data) in persisted.into_iter().take(50_000) {
                 openapi.merge_endpoint_data(&path, &method, &data);
             }
-        }
+        });
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let (proxy_handle, proxy_port) = if !options.docs_only {
@@ -200,7 +290,13 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             validate: options.validate,
         });
         let (listener, port) = proxy::bind_listener(options.port).await?;
-        let task = spawn_listener("proxy", listener, proxy_router(shared), shutdown_rx.clone());
+        let task = spawn_listener_tls(
+            "proxy",
+            listener,
+            options.downstream_tls.clone(),
+            proxy_router(shared),
+            shutdown_rx.clone(),
+        );
         (Some(task), port)
     } else {
         (None, options.port)

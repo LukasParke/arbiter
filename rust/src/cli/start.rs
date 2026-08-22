@@ -443,6 +443,19 @@ async fn run_async(
         }
     };
 
+    // Reverse-proxy downstream TLS (W1): --tls-cert/--tls-key serve the proxy
+    // listener over HTTPS directly.
+    let downstream_tls = match (args.tls.tls_cert.as_ref(), args.tls.tls_key.as_ref()) {
+        (Some(cert), Some(key)) => match crate::server::tls_downstream::load_identity(cert, key) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                print_error(&e);
+                return 1;
+            }
+        },
+        _ => None,
+    };
+
     // Live OpenAPI validation (W7 seam; consumed by the proxy pipeline).
     let mut validation_collector: Option<Arc<crate::validation::violations::ViolationsCollector>> =
         None;
@@ -485,6 +498,7 @@ async fn run_async(
         proxy_only: args.proxy_only,
         verbose: args.verbose,
         intercept,
+        downstream_tls,
         fault,
         header_rules,
         hooks,
@@ -548,7 +562,16 @@ async fn build_intercept(tls: &crate::cli::ca::CaArgs) -> Result<InterceptTlsCon
         .ca_key
         .clone()
         .unwrap_or_else(|| dir.join(crate::tls::ca::CA_KEY_FILE));
+    let first_use = !cert_path.exists();
     let ca = ensure_ca(&dir, tls.ca_alg.into(), &cert_path, &key_path).await?;
+    if first_use {
+        println!(
+            "Generated new CA for TLS interception:\n  cert: {}\n  key:  {}\nTrust it in your client (see `arbiter ca generate --install-hint`):\n{}",
+            cert_path.display(),
+            key_path.display(),
+            crate::tls::ca::install_hint()
+        );
+    }
 
     let rules = PassthroughRules::compile(&tls.tls_passthrough)?;
     Ok(InterceptTlsConfig {

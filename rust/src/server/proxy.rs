@@ -49,6 +49,13 @@ const SKIPPED_EXTENSIONS: [&str; 9] = [
 /// Content types whose traffic is never recorded (images are kept, like TS).
 const SKIPPED_CONTENT_FRAGMENTS: [&str; 4] = ["javascript", "css", "html", "font/"];
 
+tokio::task_local! {
+    /// CONNECT tunnel metadata for the current decrypted connection. Set by
+    /// the intercepted-connection handler before the pipeline runs; consumed
+    /// when `RecordMeta` is built so exchanges carry tunnel evidence.
+    static CONN_TUNNEL: std::cell::RefCell<Option<crate::types::TunnelInfo>>;
+}
+
 pub struct ProxyShared {
     pub target: url::Url,
     /// Monotonic per-process exchange counter for hook contexts.
@@ -205,6 +212,31 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
         match decision {
             FaultDecision::Reset => return reset_connection_response(),
             FaultDecision::Timeout => {
+                // AMEND-5: the client-facing faulted response is captured.
+                let recorder = Arc::clone(&shared);
+                let r_method = method.to_string();
+                let r_body = request_body.clone();
+                let mut headers: HeaderMapValues = Default::default();
+                headers.insert("content-length".into(), vec!["0".into()]);
+                tokio::task::spawn_blocking(move || {
+                    record_exchange(
+                        &recorder,
+                        RecordMeta {
+                            started_at_ms,
+                            time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
+                            method: r_method,
+                            path: path.clone(),
+                            raw_query: raw_query.clone(),
+                            request_headers: request_headers.clone(),
+                            request_body: r_body,
+                            status: 504,
+                            tunnel: None,
+                            validation_seq: 0,
+                            response_headers: headers,
+                        },
+                        &[],
+                    );
+                });
                 return plain_response(StatusCode::GATEWAY_TIMEOUT, "text/plain", "");
             }
             FaultDecision::Status(_) | FaultDecision::Garbage => {
@@ -238,12 +270,13 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
                             request_headers: request_headers.clone(),
                             request_body: r_body,
                             status,
+                            tunnel: None,
+                            validation_seq: 0,
                             response_headers: {
                                 let mut h: HeaderMapValues = Default::default();
                                 h.insert("content-type".into(), vec![ct]);
                                 h
                             },
-                            validation_seq: 0,
                         },
                         &b,
                     );
@@ -379,6 +412,7 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
                     request_body,
                     status: status.as_u16(),
                     response_headers,
+                    tunnel: None,
                     validation_seq,
                 },
                 passthrough_headers,
@@ -400,6 +434,7 @@ async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response
             request_body,
             status: status.as_u16(),
             response_headers,
+            tunnel: None,
             validation_seq,
         },
         passthrough_headers,
@@ -419,6 +454,13 @@ fn resolve_origin(shared: &ProxyShared, uri: &http::Uri) -> url::Url {
         }
     }
     shared.target.clone()
+}
+
+fn split_authority_for_tunnel(authority: &str) -> (String, u16) {
+    match parse_authority(authority) {
+        Ok(t) => (t.host, t.port),
+        Err(_) => (authority.to_string(), 443),
+    }
 }
 
 /// M3a: CONNECT handling. With interception configured, answer the tunnel
@@ -441,22 +483,32 @@ async fn handle_connect(
                         // statically: this breaks the type-level recursion
                         // that made the future !Send.
                         let handler_authority = authority.clone();
+                        let (t_host, t_port) = split_authority_for_tunnel(&handler_authority);
                         let handler: crate::server::intercept::InterceptHandler =
                             Arc::new(move |mut decrypted| {
                                 let pipeline = Arc::clone(&pipeline);
                                 let authority = handler_authority.clone();
-                                Box::pin(async move {
-                                    let path_q = decrypted
-                                        .uri()
-                                        .path_and_query()
-                                        .map(|p| p.as_str().to_string())
-                                        .unwrap_or_else(|| "/".to_string());
-                                    let absolute = format!("https://{authority}{path_q}");
-                                    if let Ok(u) = absolute.parse() {
-                                        *decrypted.uri_mut() = u;
-                                    }
-                                    pipeline(decrypted).await
-                                })
+                                let tunnel = Some(crate::types::TunnelInfo {
+                                    host: t_host.clone(),
+                                    port: t_port,
+                                    intercepted: true,
+                                    alpn: None,
+                                });
+                                Box::pin(CONN_TUNNEL.scope(
+                                    std::cell::RefCell::new(tunnel),
+                                    async move {
+                                        let path_q = decrypted
+                                            .uri()
+                                            .path_and_query()
+                                            .map(|p| p.as_str().to_string())
+                                            .unwrap_or_else(|| "/".to_string());
+                                        let absolute = format!("https://{authority}{path_q}");
+                                        if let Ok(u) = absolute.parse() {
+                                            *decrypted.uri_mut() = u;
+                                        }
+                                        pipeline(decrypted).await
+                                    },
+                                ))
                             });
                         if let Err(e) = serve_intercepted(
                             hyper_util::rt::TokioIo::new(io),
@@ -537,7 +589,12 @@ async fn handle_websocket(
     };
 
     // Forward with hop-by-hop upgrade headers restored.
-    let forward = to_http_header_map(&forwardable_headers(&request_headers, true));
+    let forwardable_ws: HeaderMapValues = request_headers
+        .iter()
+        .filter(|(name, _)| !name.starts_with("sec-websocket-"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let forward = to_http_header_map(&forwardable_headers(&forwardable_ws, true));
     let method = req.method().clone();
     let mut upstream_request = proxy_client()
         .request(method.clone(), upstream_url)
@@ -667,34 +724,74 @@ async fn stream_response(
         std::result::Result<axum::body::Bytes, std::io::Error>,
     >(16);
     tokio::spawn(async move {
+        // Bounded-memory recording (perf bar): tee chunks into RAM up to the
+        // cap, then spill to a temp file. The client stream is never delayed
+        // or truncated by recording; oversized bodies still get recorded
+        // byte-exact from the spill file.
+        const RECORD_SPILL_CAP: usize = 32 * 1024 * 1024;
         let mut buffer = Vec::new();
+        let mut spill: Option<(std::fs::File, std::path::PathBuf)> = None;
+        let mut spilled_bytes = 0usize;
         let mut stream = upstream_response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.extend_from_slice(&bytes);
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        break; // client went away; keep what we have
-                    }
-                }
+            let chunk = match chunk {
+                Ok(bytes) => bytes,
                 Err(e) => {
                     let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                     break;
                 }
+            };
+            if spill.is_none() && buffer.len() + chunk.len() > RECORD_SPILL_CAP {
+                let path = std::env::temp_dir().join(format!(
+                    "arbiter-record-{}-{}",
+                    std::process::id(),
+                    meta.started_at_ms
+                ));
+                match std::fs::File::create(&path) {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        let _ = f.write_all(&buffer);
+                        spill = Some((f, path));
+                        buffer = Vec::new();
+                    }
+                    Err(_) => buffer = Vec::new(), // degrade: skip recording this body
+                }
+            }
+            if let Some((f, _)) = &mut spill {
+                use std::io::Write as _;
+                let _ = f.write_all(&chunk);
+                spilled_bytes += chunk.len();
+            } else {
+                buffer.extend_from_slice(&chunk);
+            }
+            if tx.send(Ok(chunk)).await.is_err() {
+                break; // client went away; keep what we have
             }
         }
         drop(tx);
         // Recording is fully synchronous CPU work (schema inference, JSON
         // tree building, gzip decode). Run it on the blocking pool so it
         // never occupies async worker threads under concurrency.
+        let _ = spilled_bytes;
         tokio::task::spawn_blocking(move || {
+            let final_body = match spill {
+                Some((mut f, path)) => {
+                    use std::io::{Read as _, Seek as _};
+                    let _ = f.seek(std::io::SeekFrom::Start(0));
+                    let mut bytes = Vec::with_capacity(spilled_bytes);
+                    let _ = f.read_to_end(&mut bytes);
+                    let _ = std::fs::remove_file(&path);
+                    bytes
+                }
+                None => buffer,
+            };
             record_exchange(
                 &shared,
                 RecordMeta {
                     time_ms: chrono::Utc::now().timestamp_millis() - meta.started_at_ms,
                     ..meta
                 },
-                &buffer,
+                &final_body,
             );
         });
     });
@@ -721,7 +818,7 @@ async fn buffered_response_with_hook(
     shared: Arc<ProxyShared>,
     upstream_response: reqwest::Response,
     mut meta: RecordMeta,
-    passthrough_headers: HeaderMapValues,
+    mut passthrough_headers: HeaderMapValues,
 ) -> Response {
     let mut body = Vec::new();
     let mut stream = upstream_response.bytes_stream();
@@ -749,12 +846,15 @@ async fn buffered_response_with_hook(
             method: meta.method.clone(),
             path: meta.path.clone(),
             query: meta.raw_query.clone(),
-            headers: redacted_view(&meta.request_headers, &shared.policy),
+            headers: redacted_view(&meta.response_headers, &shared.policy),
             body: Some(&body),
         };
         match run_response_hook(hooks, &ctx).await {
             crate::rules::hooks::HookOutcome::Unchanged => {}
             crate::rules::hooks::HookOutcome::Modified(modified) => {
+                // Hook rewrites reach BOTH the record and the client: the
+                // client response is built from passthrough_headers.
+                modified.apply_headers(&mut passthrough_headers);
                 modified.apply_headers(&mut meta.response_headers);
                 if let Some(new_body) = modified.decoded_body() {
                     body = new_body;
@@ -840,11 +940,16 @@ struct RecordMeta {
     /// response leg in `LiveValidator`'s pending map (`0` = not validated,
     /// e.g. fault-short-circuited exchanges).
     validation_seq: u64,
+    /// CONNECT tunnel metadata (intercepted or passthrough); None = plain.
+    tunnel: Option<crate::types::TunnelInfo>,
 }
 
 /// Background recording: HAR entry, OpenAPI endpoint, and optional SQLite
 /// persistence — all best-effort, never failing the proxied exchange.
-fn record_exchange(shared: &ProxyShared, meta: RecordMeta, response_body: &[u8]) {
+fn record_exchange(shared: &ProxyShared, mut meta: RecordMeta, response_body: &[u8]) {
+    if meta.tunnel.is_none() {
+        meta.tunnel = CONN_TUNNEL.try_with(|c| c.borrow().clone()).unwrap_or(None);
+    }
     // Live OpenAPI validation, response leg (W7). Runs inside the same
     // blocking task as recording, on the settled (post-hook) body. `seq == 0`
     // marks exchanges that never ran the request leg (fault short-circuit);

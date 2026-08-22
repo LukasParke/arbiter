@@ -64,10 +64,17 @@ fn spec_from_db(shared: &DocsShared) -> Option<serde_json::Value> {
 }
 
 async fn har_endpoint(State(shared): State<Arc<DocsShared>>) -> Response {
-    let body = match shared.db.as_ref().and_then(|db| db.get_har_log().ok()) {
-        Some(log) => log.to_string(),
-        None => shared.har.get_har().to_string(),
-    };
+    // Full-table sqlite scans are blocking work: run them off the async
+    // workers so concurrent proxy recording never queues behind a docs hit.
+    let db = shared.db.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        match db.as_ref().and_then(|db| db.get_har_log().ok()) {
+            Some(log) => log.to_string(),
+            None => shared.har.get_har().to_string(),
+        }
+    })
+    .await
+    .unwrap_or_default();
     json_response(&body)
 }
 
@@ -124,12 +131,23 @@ fn pairs_to_object(pairs: Option<&Vec<serde_json::Value>>) -> serde_json::Value 
 }
 
 async fn openapi_json_endpoint(State(shared): State<Arc<DocsShared>>) -> Response {
-    let spec = spec_from_db(&shared).unwrap_or_else(|| shared.openapi.generate_openapi());
+    let spec = tokio::task::spawn_blocking(move || match spec_from_db(&shared) {
+        Some(spec) => spec,
+        None => shared.openapi.generate_openapi(),
+    })
+    .await
+    .unwrap_or(serde_json::Value::Null);
     json_response(&spec.to_string())
 }
 
 async fn openapi_yaml_endpoint(State(shared): State<Arc<DocsShared>>) -> Response {
-    let spec = spec_from_db(&shared).unwrap_or_else(|| shared.openapi.generate_openapi());
+    let shared2 = Arc::clone(&shared);
+    let spec = tokio::task::spawn_blocking(move || match spec_from_db(&shared2) {
+        Some(spec) => spec,
+        None => shared2.openapi.generate_openapi(),
+    })
+    .await
+    .unwrap_or(serde_json::Value::Null);
     let yaml = serde_yaml::to_string(&spec).unwrap_or_default();
     Response::builder()
         .status(StatusCode::OK)

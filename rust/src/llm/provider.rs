@@ -134,8 +134,11 @@ impl ProviderDetector {
                 "path /models/{model}:generateContent|generateMessage|countTokens",
             );
         }
-        if header(ctx.headers, "x-goog-api-key").is_some() {
-            return Detection::new(Provider::Google, "x-goog-api-key header");
+        if ctx.has_header("x-goog-api-key") {
+            return Detection::new(
+                Provider::Google,
+                "x-goog-api-key header (value may be redacted)",
+            );
         }
 
         // 3. azure-openai — deployment host or api-key header.
