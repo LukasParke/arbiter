@@ -367,3 +367,13 @@ mod tests {
         assert!(outcome.tls.is_none());
     }
 }
+
+impl std::fmt::Debug for InterceptTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterceptTlsConfig")
+            .field("ca", &"<CaHandle>")
+            .field("cache_len", &self.cache.len())
+            .field("passthrough_rules", &self.rules)
+            .finish()
+    }
+}

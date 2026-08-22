@@ -18,6 +18,10 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::middleware::HarStore;
+use crate::mock::fault::FaultInjector;
+use crate::rules::hooks::HookConfig;
+use crate::rules::HeaderRuleSet;
+use crate::server::intercept::InterceptTlsConfig;
 use crate::storage::SqliteStore;
 use crate::store::OpenApiStore;
 use futures::future::BoxFuture;
@@ -43,6 +47,18 @@ pub struct ServerOptions {
     /// Start only the proxy listener; the docs server is not bound.
     pub proxy_only: bool,
     pub verbose: bool,
+    /// TLS interception (CONNECT MITM); `None` = plain HTTP proxy only
+    /// (M3a seam, wired from `start`'s typed CA flags at M3d assembly).
+    pub intercept: Option<InterceptTlsConfig>,
+    /// Fault injection on proxied traffic; `None` = disabled (AMEND-5).
+    pub fault: Option<FaultInjector>,
+    /// Header rewrite rules (request-direction, response-direction).
+    pub header_rules: Option<(HeaderRuleSet, HeaderRuleSet)>,
+    /// Subprocess/webhook hooks; `None` = disabled (W6).
+    pub hooks: Option<HookConfig>,
+    /// Live OpenAPI validation over proxied traffic; `None` = disabled
+    /// (W7 seam for `--validate-spec`; consumed by the proxy pipeline).
+    pub validate: Option<Arc<crate::validation::violations::LiveValidator>>,
 }
 
 impl Default for ServerOptions {
@@ -55,6 +71,11 @@ impl Default for ServerOptions {
             docs_only: false,
             proxy_only: false,
             verbose: false,
+            intercept: None,
+            fault: None,
+            header_rules: None,
+            hooks: None,
+            validate: None,
         }
     }
 }
@@ -163,15 +184,20 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
             }
         }
     }
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let (proxy_handle, proxy_port) = if !options.docs_only {
         let shared = Arc::new(ProxyShared {
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             target: options.target.clone(),
             openapi: Arc::clone(&openapi),
             har: Arc::clone(&har),
             policy: crate::redaction::RedactionPolicy::default(),
             db: db.clone(),
             verbose: options.verbose,
+            intercept: options.intercept,
+            fault: options.fault,
+            header_rules: options.header_rules,
+            hooks: options.hooks,
         });
         let (listener, port) = proxy::bind_listener(options.port).await?;
         let task = spawn_listener("proxy", listener, proxy_router(shared), shutdown_rx.clone());

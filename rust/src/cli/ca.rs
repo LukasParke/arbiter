@@ -135,7 +135,7 @@ async fn run_async(args: &CaArgs) -> Result<i32> {
 }
 
 /// Expand a leading `~` against $HOME ($USERPROFILE on Windows).
-fn expand_tilde(raw: &str) -> Result<PathBuf> {
+pub(crate) fn expand_tilde(raw: &str) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("~/").or(trimmed.strip_prefix("~\\")) {
         let home = home_dir()?;

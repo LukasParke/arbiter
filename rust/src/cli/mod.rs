@@ -16,6 +16,7 @@ mod gateway;
 mod generate_spec;
 mod generate_traffic;
 mod infer_schemas;
+mod mock;
 mod output;
 mod replay;
 mod sanitize;
@@ -30,9 +31,18 @@ use std::path::{Path, PathBuf};
 use crate::version::ARBITER_VERSION;
 
 /// API proxy with OpenAPI generation and HAR export capabilities
+///
+/// Examples:
+///   arbiter start -t https://api.anthropic.com
+///   arbiter capture -t http://up.test -o out --exact
+///   arbiter replay bundle-dir --mode semantic-json-response
 #[derive(Parser)]
 #[command(name = "arbiter", version = ARBITER_VERSION)]
 struct Cli {
+    /// Emit machine-readable JSON output for commands that support it.
+    #[arg(long)]
+    json: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -66,6 +76,18 @@ enum Command {
     ValidateBundle(validate::ValidateBundleArgs),
     /// Run a credential-injecting gateway for untrusted clients
     Gateway(gateway::GatewayArgs),
+    /// Generate and manage the local TLS certificate authority
+    Ca(ca::CaArgs),
+    /// Serve mocked API responses from captures or an OpenAPI spec
+    Mock(mock::MockCommand),
+    /// Interactive terminal UI for live or captured flows
+    Tui(tui::TuiCommand),
+    /// Classify LLM traffic in a capture bundle and report schema drift
+    Fingerprint(fingerprint::FingerprintCommand),
+    /// Inspect and initialize the arbiter config file
+    Config(config_cmd::ConfigArgs),
+    /// Generate shell completions for bash/zsh/fish/powershell
+    Complete(complete::CompleteArgs),
 }
 
 /// Parse args, dispatch the subcommand, and exit with its status code.
@@ -81,24 +103,75 @@ pub fn run() -> ! {
             .unwrap_or_else(|e| e.exit());
         let args =
             start::StartArgs::from_arg_matches(&matches).expect("start arg matches round-trip");
-        std::process::exit(start::run(&args));
+        std::process::exit(start::run_layered(&args, Some(&matches)));
     }
 
-    let cli = Cli::parse();
-    let code = match cli.command {
-        Some(Command::Start(args)) => start::run(&args),
-        Some(Command::Diff(args)) => diff_cmd::run(&args),
-        Some(Command::GenerateTraffic(args)) => generate_traffic::run(&args),
-        Some(Command::Discover(args)) => discover::run(&args),
-        Some(Command::ValidateSchemas(args)) => validate_schemas::run(&args),
-        Some(Command::Auth(args)) => auth::run(&args),
-        Some(Command::InferSchemas(args)) => infer_schemas::run(&args),
-        Some(Command::Replay(args)) => replay::run(&args),
-        Some(Command::GenerateSpec(args)) => generate_spec::run(&args),
-        Some(Command::Capture(args)) => capture::run(&args),
-        Some(Command::Sanitize(args)) => sanitize::run(&args),
-        Some(Command::ValidateBundle(args)) => validate::run(&args),
-        Some(Command::Gateway(args)) => gateway::run(&args),
+    // Parse once against the real root command so `start` layering can read
+    // clap value_source() per flag (AMEND-3: CLI flags must beat file/env).
+    let matches = <Cli as clap::CommandFactory>::command()
+        .try_get_matches_from(std::env::args_os())
+        .unwrap_or_else(|e| e.exit());
+
+    let json = matches.get_flag("json");
+    let verbose = ["start", "capture", "replay"]
+        .iter()
+        .find_map(|name| {
+            matches
+                .subcommand_matches(name)
+                .map(|m| m.get_flag("verbose"))
+        })
+        .unwrap_or(false);
+    crate::cli::output::init_tracing(verbose, json);
+
+    let code = match matches.subcommand() {
+        Some(("start", m)) => start::run_layered(
+            &start::StartArgs::from_arg_matches(m).expect("start arg matches round-trip"),
+            Some(m),
+        ),
+        Some(("diff", m)) => diff_cmd::run(&diff_cmd::DiffArgs::from_arg_matches(m).expect("args")),
+        Some(("generate-traffic", m)) => generate_traffic::run(
+            &generate_traffic::GenerateTrafficArgs::from_arg_matches(m).expect("args"),
+        ),
+        Some(("discover", m)) => {
+            discover::run(&discover::DiscoverArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("validate-schemas", m)) => validate_schemas::run(
+            &validate_schemas::ValidateSchemasArgs::from_arg_matches(m).expect("args"),
+        ),
+        Some(("auth", m)) => auth::run(&auth::AuthArgs::from_arg_matches(m).expect("args")),
+        Some(("infer-schemas", m)) => {
+            infer_schemas::run(&infer_schemas::InferSchemasArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("replay", m)) => replay::run(&replay::ReplayArgs::from_arg_matches(m).expect("args")),
+        Some(("generate-spec", m)) => {
+            generate_spec::run(&generate_spec::GenerateSpecArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("capture", m)) => {
+            capture::run(&capture::CaptureArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("sanitize", m)) => {
+            sanitize::run(&sanitize::SanitizeArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("validate", m)) => {
+            validate::run(&validate::ValidateBundleArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("gateway", m)) => {
+            gateway::run(&gateway::GatewayArgs::from_arg_matches(m).expect("args"))
+        }
+        Some(("ca", m)) => ca::run_ca(&ca::CaArgs::from_arg_matches(m).expect("args"))
+            .unwrap_or_else(|e| report_command_error(&e)),
+        Some(("mock", m)) => run_mock(&mock::MockCommand::from_arg_matches(m).expect("args")),
+        Some(("tui", m)) => tui::run(&tui::TuiCommand::from_arg_matches(m).expect("args")),
+        Some(("fingerprint", m)) => {
+            fingerprint::run(&fingerprint::FingerprintCommand::from_arg_matches(m).expect("args"))
+        }
+        Some(("config", m)) => {
+            let args = config_cmd::ConfigArgs::from_arg_matches(m).expect("args");
+            config_cmd::run(args.command).unwrap_or_else(|e| report_command_error(&e))
+        }
+        Some(("complete", m)) => {
+            complete::run(&complete::CompleteArgs::from_arg_matches(m).expect("args"))
+        }
         None => {
             // Bare invocation: commander still runs the default command,
             // which fails on its required --target.
@@ -107,13 +180,32 @@ pub fn run() -> ! {
                 .unwrap_or_else(|e| e.exit());
             let args =
                 start::StartArgs::from_arg_matches(&matches).expect("start arg matches round-trip");
-            start::run(&args)
+            start::run_layered(&args, Some(&matches))
         }
+        // clap rejects unknown subcommands before we get here.
+        _ => 2,
     };
     std::process::exit(code);
 }
 
-const SUBCOMMAND_NAMES: [&str; 13] = [
+/// Print a command error in house style (cause + help hint) and map to an
+/// exit code for commands returning `Result<i32>`.
+fn report_command_error(e: &crate::error::Error) -> i32 {
+    crate::cli::output::print_error(e);
+    1
+}
+
+/// Run the mock server on a dedicated tokio runtime, mapping errors to the
+/// house error format.
+fn run_mock(command: &mock::MockCommand) -> i32 {
+    let runtime = tokio::runtime::Runtime::new().expect("mock tokio runtime");
+    match runtime.block_on(command.run()) {
+        Ok(()) => 0,
+        Err(e) => report_command_error(&e),
+    }
+}
+
+const SUBCOMMAND_NAMES: [&str; 19] = [
     "start",
     "diff",
     "generate-traffic",
@@ -127,7 +219,19 @@ const SUBCOMMAND_NAMES: [&str; 13] = [
     "sanitize",
     "validate",
     "gateway",
+    "ca",
+    "mock",
+    "tui",
+    "fingerprint",
+    "config",
+    "complete",
 ];
+
+/// The assembled root command. Single source for both argument parsing and
+/// shell-completion generation (`cli::complete::build_cli` delegates here).
+pub(crate) fn root_command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}
 
 /// True when the invocation has a leading positional token that is not a
 /// registered subcommand — i.e. the args are really options for the default

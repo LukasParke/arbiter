@@ -21,15 +21,24 @@ use futures::StreamExt;
 use serde_json::json;
 
 use crate::auth::detect_security_schemes;
+use crate::mock::fault::{FaultDecision, FaultInjector};
+
 use crate::error::{Error, Result};
 use crate::headers::{
     forwardable_headers, from_http_header_map, is_hop_by_hop, to_http_header_map,
 };
 use crate::middleware::{build_har_entry, HarEntryParts, HarStore};
 use crate::redaction::{RedactionPolicy, REDACTED_VALUE};
+use crate::rules::hooks::{
+    run_request_hook, run_response_hook, HookConfig, HookContext, HookOutcome,
+};
+use crate::rules::HeaderRuleSet;
+use crate::server::connect::{decide, parse_authority};
+use crate::server::intercept::{serve_intercepted, InterceptTlsConfig};
 use crate::storage::SqliteStore;
 use crate::store::OpenApiStore;
 use crate::types::HeaderMapValues;
+use crate::ws::is_websocket_upgrade;
 
 /// Request body ceiling, mirroring the TS `bodyParser` 10 MB limits.
 pub const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
@@ -42,25 +51,44 @@ const SKIPPED_EXTENSIONS: [&str; 9] = [
 /// Content types whose traffic is never recorded (images are kept, like TS).
 const SKIPPED_CONTENT_FRAGMENTS: [&str; 4] = ["javascript", "css", "html", "font/"];
 
-/// State shared by the proxy app and the background recorder.
 pub struct ProxyShared {
     pub target: url::Url,
+    /// Monotonic per-process exchange counter for hook contexts.
+    pub(crate) next_seq: std::sync::atomic::AtomicU64,
     pub openapi: Arc<OpenApiStore>,
     pub har: Arc<HarStore>,
     pub policy: RedactionPolicy,
     pub db: Option<Arc<SqliteStore>>,
     pub verbose: bool,
+    /// TLS interception config; `Some` enables CONNECT MITM (M3a).
+    pub intercept: Option<InterceptTlsConfig>,
+    /// Fault injector shared by proxy mode (AMEND-5); `None` = disabled.
+    pub fault: Option<FaultInjector>,
+    /// Ordered header rewrite rules: (request-direction, response-direction).
+    pub header_rules: Option<(HeaderRuleSet, HeaderRuleSet)>,
+    /// Subprocess/webhook hooks; `None` = disabled.
+    pub hooks: Option<HookConfig>,
 }
 
 impl ProxyShared {
+    fn next_sequence(&self) -> u64 {
+        self.next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new(target: url::Url) -> Self {
         Self {
+            next_seq: std::sync::atomic::AtomicU64::new(0),
             target,
             openapi: Arc::new(OpenApiStore::new()),
             har: Arc::new(HarStore::new()),
             policy: RedactionPolicy::default(),
             db: None,
             verbose: false,
+            intercept: None,
+            fault: None,
+            header_rules: None,
+            hooks: None,
         }
     }
 }
@@ -83,8 +111,48 @@ pub fn proxy_router(shared: Arc<ProxyShared>) -> Router {
 }
 
 async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> Response {
+    handle_request(shared, req).await
+}
+
+/// Plain entry point shared by the axum router and TLS-intercepted
+/// connections (M3a): every request funnels here exactly once.
+async fn handle_request(shared: Arc<ProxyShared>, mut req: Request) -> Response {
+    // The pipeline handed to TLS-intercepted streams: plain HTTP entry that
+    // rejects nested CONNECT (proxy chaining) — this keeps the handler tree
+    // free of static recursion, so futures stay Send.
+    let shared_for_pipeline = Arc::clone(&shared);
+    let pipeline: crate::server::intercept::InterceptHandler = Arc::new(move |decrypted| {
+        let shared = Arc::clone(&shared_for_pipeline);
+        Box::pin(async move {
+            if decrypted.method() == http::Method::CONNECT {
+                return plain_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "text/plain",
+                    "nested CONNECT is not supported",
+                );
+            }
+            let decrypted = decrypted.map(axum::body::Body::new);
+            handle_request_core(shared, decrypted).await
+        })
+    });
+    // Top-level CONNECT tunnels hijack the connection before body handling.
+    if req.method() == http::Method::CONNECT {
+        return handle_connect(shared, pipeline, req).await;
+    }
+    let req = req.map(axum::body::Body::new);
+    handle_request_core(shared, req).await
+}
+
+/// Core non-CONNECT pipeline (fault gate, hooks, rules, upstream, record).
+async fn handle_request_core(shared: Arc<ProxyShared>, req: Request) -> Response {
     let started_at_ms = chrono::Utc::now().timestamp_millis();
     let method = req.method().clone();
+
+    // Per-request origin: intercepted traffic arrives in absolute form
+    // (https + CONNECT authority); reverse-proxy mode uses path form
+    // against the configured target.
+    let target_origin = resolve_origin(&shared, req.uri());
+
     if shared.verbose {
         println!("Proxying: {} {}", method, req.uri());
     }
@@ -96,10 +164,22 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     let raw_query = req.uri().query().unwrap_or("").to_string();
-    let request_headers = from_http_header_map(req.headers());
+    let mut request_headers = from_http_header_map(req.headers());
+
+    // M3b: WebSocket upgrades bypass body buffering entirely.
+    if is_websocket_upgrade(req.headers()) {
+        return handle_websocket(
+            Arc::clone(&shared),
+            req,
+            started_at_ms,
+            path_and_query,
+            request_headers,
+        )
+        .await;
+    }
 
     // Buffer the raw request body (byte-exact, like the TS raw bodyParser).
-    let request_body = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BYTES).await {
+    let mut request_body = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
             return plain_response(
@@ -110,10 +190,117 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
         }
     };
 
+    // M3c pipeline order (AMEND-12): fault gate -> request hooks ->
+    // request header rules -> upstream -> tee-pump (unchanged) ->
+    // response header rules (pre-stream) -> response hooks (buffered) ->
+    // client.
+
+    // Fault gate FIRST: one atomic draw decides everything (AMEND-5).
+    let fault_decision = shared.fault.as_ref().map(|f| f.inject_before_upstream());
+    if let Some(decision) = &fault_decision {
+        if let Some(delay) = decision.delay() {
+            tokio::time::sleep(delay).await;
+        }
+        match decision {
+            FaultDecision::Reset => return reset_connection_response(),
+            FaultDecision::Timeout => {
+                return plain_response(StatusCode::GATEWAY_TIMEOUT, "text/plain", "");
+            }
+            FaultDecision::Status(_) | FaultDecision::Garbage => {
+                let mut status = 200u16;
+                let mut body = Vec::new();
+                let mut content_type = String::from("application/json");
+                let replaced = shared
+                    .fault
+                    .as_ref()
+                    .expect("decision implies injector")
+                    .apply_to_response(decision, &mut status, &mut body, &mut content_type);
+                debug_assert!(replaced);
+                // AMEND-5: the faulted client-facing response IS what gets
+                // captured.
+                let mut headers: HeaderMapValues = Default::default();
+                headers.insert("content-type".into(), vec![content_type.clone()]);
+                let recorder = Arc::clone(&shared);
+                let r_method = method.to_string();
+                let r_body = request_body.clone();
+                let ct = content_type.clone();
+                let b = body.clone();
+                tokio::task::spawn_blocking(move || {
+                    record_exchange(
+                        &recorder,
+                        RecordMeta {
+                            started_at_ms,
+                            time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
+                            method: r_method,
+                            path: path.clone(),
+                            raw_query: raw_query.clone(),
+                            request_headers: request_headers.clone(),
+                            request_body: r_body,
+                            status,
+                            response_headers: {
+                                let mut h: HeaderMapValues = Default::default();
+                                h.insert("content-type".into(), vec![ct]);
+                                h
+                            },
+                        },
+                        &b,
+                    );
+                });
+                let mut builder = Response::builder().status(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                );
+                if let Ok(v) = http::HeaderValue::from_str(&content_type) {
+                    builder = builder.header("content-type", v);
+                }
+                return builder.body(Body::from(body)).unwrap_or_else(|_| {
+                    plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "")
+                });
+            }
+            FaultDecision::Latency(_) | FaultDecision::None => {}
+        }
+    }
+
+    // Request hooks (subprocess/webhook). Fail-open on timeout; Drop means
+    // the hook explicitly rejected the exchange.
+    if let Some(hooks) = &shared.hooks {
+        if hooks.is_configured() {
+            let seq = shared.next_sequence();
+            let ctx = HookContext {
+                sequence: seq,
+                method: method.to_string(),
+                path: path.clone(),
+                query: raw_query.clone(),
+                headers: redacted_view(&request_headers, &shared.policy),
+                body: Some(&request_body),
+            };
+            match run_request_hook(hooks, &ctx).await {
+                crate::rules::hooks::HookOutcome::Unchanged => {}
+                crate::rules::hooks::HookOutcome::Modified(modified) => {
+                    modified.apply_headers(&mut request_headers);
+                    if let Some(body) = modified.decoded_body() {
+                        request_body = axum::body::Bytes::from(body);
+                    }
+                }
+                crate::rules::hooks::HookOutcome::Drop => {
+                    return plain_response(
+                        StatusCode::BAD_GATEWAY,
+                        "application/json",
+                        "{\"error\":\"dropped by request hook\"}",
+                    );
+                }
+            }
+        }
+    }
+
+    // Request-direction header rules apply before forwarding decisions.
+    if let Some((request_rules, _)) = &shared.header_rules {
+        request_rules.apply(&mut request_headers);
+    }
+
     // Forward end-to-end headers only; the client re-computes framing and
     // derives Host from the upstream URL (changeOrigin semantics).
     let forward_headers = to_http_header_map(&forwardable_headers(&request_headers, true));
-    let upstream_url = match shared.target.join(&path_and_query) {
+    let upstream_url = match target_origin.join(&path_and_query) {
         Ok(url) => url,
         Err(e) => return proxy_error_response(&e.to_string()),
     };
@@ -132,28 +319,328 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
     };
 
     let status = upstream_response.status();
-    let response_headers = from_http_header_map(upstream_response.headers());
+    let mut response_headers = from_http_header_map(upstream_response.headers());
+
+    // Response-direction header rules apply before anything reaches the
+    // client (safe: headers have not been sent yet).
+    if let Some((_, response_rules)) = &shared.header_rules {
+        response_rules.apply(&mut response_headers);
+    }
 
     // End-to-end response headers only; framing is managed by the HTTP layer
     // (forwarding `transfer-encoding`/`content-length` corrupts streaming).
-    let mut passthrough_headers = axum::http::HeaderMap::new();
-    for (name, value) in upstream_response.headers() {
-        if is_hop_by_hop(name.as_str()) || name == axum::http::header::CONTENT_LENGTH {
+    let mut passthrough_headers = HeaderMapValues::new();
+    for name in response_headers.keys() {
+        if is_hop_by_hop(name) || name == "content-length" {
             continue;
         }
-        passthrough_headers.append(name, value.clone());
+        if let Some(values) = response_headers.get(name) {
+            passthrough_headers.insert(name.clone(), values.clone());
+        }
     }
 
-    // Pump upstream chunks to the client while teeing them into the
-    // recording buffer; recording runs after the last chunk, off the client's
-    // critical path.
+    // Response hooks need the complete body to reason about it: when
+    // configured, switch to buffered mode for this exchange.
+    if let Some(hooks) = &shared.hooks {
+        if hooks.response_cmd.is_some() || hooks.webhook_url.is_some() {
+            return buffered_response_with_hook(
+                shared,
+                upstream_response,
+                RecordMeta {
+                    started_at_ms,
+                    time_ms: 0,
+                    method: method.to_string(),
+                    path,
+                    raw_query,
+                    request_headers,
+                    request_body,
+                    status: status.as_u16(),
+                    response_headers,
+                },
+                passthrough_headers,
+            )
+            .await;
+        }
+    }
+
+    stream_response(
+        shared,
+        upstream_response,
+        RecordMeta {
+            started_at_ms,
+            time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
+            method: method.to_string(),
+            path,
+            raw_query,
+            request_headers,
+            request_body,
+            status: status.as_u16(),
+            response_headers,
+        },
+        passthrough_headers,
+        status,
+    )
+    .await
+}
+
+/// Origin for the upstream request: absolute-form URIs come from TLS-
+/// intercepted connections (the CONNECT authority); otherwise the
+/// configured target.
+fn resolve_origin(shared: &ProxyShared, uri: &http::Uri) -> url::Url {
+    if let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) {
+        let origin = format!("{}://{}", scheme, authority);
+        if let Ok(u) = url::Url::parse(&origin) {
+            return u;
+        }
+    }
+    shared.target.clone()
+}
+
+/// M3a: CONNECT handling. With interception configured, answer the tunnel
+/// and hand the decrypted stream to the normal pipeline; without a CA,
+/// tunnel bytes untouched to the authority (explicit-proxy behavior).
+async fn handle_connect(
+    shared: Arc<ProxyShared>,
+    pipeline: crate::server::intercept::InterceptHandler,
+    mut req: Request,
+) -> Response {
+    let authority = req.uri().to_string();
+    match shared.intercept.clone() {
+        Some(cfg) => {
+            // 200-with-upgrade, then take ownership of the raw TCP stream.
+            let upgrade = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                match upgrade.await {
+                    Ok(io) => {
+                        // The pipeline is injected (dyn), not called
+                        // statically: this breaks the type-level recursion
+                        // that made the future !Send.
+                        let handler_authority = authority.clone();
+                        let handler: crate::server::intercept::InterceptHandler =
+                            Arc::new(move |mut decrypted| {
+                                let pipeline = Arc::clone(&pipeline);
+                                let authority = handler_authority.clone();
+                                Box::pin(async move {
+                                    let path_q = decrypted
+                                        .uri()
+                                        .path_and_query()
+                                        .map(|p| p.as_str().to_string())
+                                        .unwrap_or_else(|| "/".to_string());
+                                    let absolute = format!("https://{authority}{path_q}");
+                                    if let Ok(u) = absolute.parse() {
+                                        *decrypted.uri_mut() = u;
+                                    }
+                                    pipeline(decrypted).await
+                                })
+                            });
+                        if let Err(e) = serve_intercepted(
+                            hyper_util::rt::TokioIo::new(io),
+                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                            &authority,
+                            cfg,
+                            handler,
+                        )
+                        .await
+                        {
+                            eprintln!("intercepted tunnel {authority} failed: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("CONNECT upgrade for {authority} failed: {e}"),
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap_or_else(|_| {
+                    plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "")
+                })
+        }
+        None => {
+            // Pure tunnel: dial the authority and copy bytes both ways.
+            let upgrade = hyper::upgrade::on(&mut req);
+            tokio::spawn(async move {
+                match upgrade.await {
+                    Ok(mut client_io) => match parse_authority(&authority) {
+                        Ok(target) => {
+                            match tokio::net::TcpStream::connect((
+                                target.host.as_str(),
+                                target.port,
+                            ))
+                            .await
+                            {
+                                Ok(mut upstream) => {
+                                    let mut client_io = hyper_util::rt::TokioIo::new(client_io);
+                                    let _ = tokio::io::copy_bidirectional(
+                                        &mut client_io,
+                                        &mut upstream,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => eprintln!("tunnel dial {authority} failed: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("bad CONNECT authority {authority}: {e}"),
+                    },
+                    Err(e) => eprintln!("CONNECT upgrade for {authority} failed: {e}"),
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap_or_else(|_| {
+                    plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", "")
+                })
+        }
+    }
+}
+
+/// M3b: WebSocket relay for the standalone proxy. The handshake is forwarded
+/// verbatim; on 101 both upgraded legs are pumped through the shared WS pump,
+/// which records messages into a minimal HAR entry (best-effort; byte-exact ws
+/// capture lives in capture sessions).
+async fn handle_websocket(
+    shared: Arc<ProxyShared>,
+    req: Request,
+    started_at_ms: i64,
+    path_and_query: String,
+    request_headers: HeaderMapValues,
+) -> Response {
+    let target_origin = resolve_origin(&shared, req.uri());
+    let upstream_url = match target_origin.join(&path_and_query) {
+        Ok(u) => u,
+        Err(e) => return proxy_error_response(&e.to_string()),
+    };
+
+    // Forward with hop-by-hop upgrade headers restored.
+    let forward = to_http_header_map(&forwardable_headers(&request_headers, true));
+    let method = req.method().clone();
+    let mut upstream_request = proxy_client()
+        .request(method.clone(), upstream_url)
+        .headers(forward)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket");
+    if let Some(key) = request_headers.get("sec-websocket-key") {
+        if let Some(v) = key.first() {
+            upstream_request = upstream_request.header("sec-websocket-key", v);
+        }
+    }
+    if let Some(protos) = request_headers.get("sec-websocket-protocol") {
+        if let Some(v) = protos.first() {
+            upstream_request = upstream_request.header("sec-websocket-protocol", v);
+        }
+    }
+    if let Some(version) = request_headers.get("sec-websocket-version") {
+        if let Some(v) = version.first() {
+            upstream_request = upstream_request.header("sec-websocket-version", v);
+        }
+    }
+
+    let upstream_response = match upstream_request.send().await {
+        Ok(r) => r,
+        Err(e) => return proxy_error_response(&e.to_string()),
+    };
+    if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return plain_response(
+            upstream_response.status(),
+            "application/json",
+            "{\"error\":\"upstream refused websocket upgrade\"}",
+        );
+    }
+
+    // Mirror the 101 + accept/protocol to the client, then upgrade locally.
+    let mut builder = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket");
+    if let Some(accept) = upstream_response.headers().get("sec-websocket-accept") {
+        builder = builder.header("sec-websocket-accept", accept);
+    }
+    if let Some(proto) = upstream_response.headers().get("sec-websocket-protocol") {
+        builder = builder.header("sec-websocket-protocol", proto);
+    }
+    let response = builder
+        .body(Body::empty())
+        .unwrap_or_else(|_| plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", ""));
+
+    // Take ownership of the client's upgraded IO and pump both legs through
+    // the shared WS recorder. Frames are relayed unmodified; the HAR entry
+    // records message counts (byte-exact ws capture lives in capture
+    // sessions).
+    let mut req = req;
+    let server_upgrade = hyper::upgrade::on(&mut req);
+    let protocol = request_headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.first().cloned());
+    let record_method = method.to_string();
+    let record_path = format!("/{}", path_and_query.trim_start_matches('/'));
+    tokio::spawn(async move {
+        let client_up = server_upgrade.await;
+        let upstream_up = upstream_response.upgrade().await;
+        let report = |e: String| eprintln!("websocket upgrade failed: {e}");
+        match (client_up, upstream_up) {
+            (Ok(client_io), Ok(upstream_io)) => {
+                // Client leg is hyper's Upgraded (runtime-agnostic): wrap for
+                // tokio IO; upstream leg is reqwest's Upgraded (tokio-native).
+                let result = crate::ws::pump_ws(
+                    hyper_util::rt::TokioIo::new(client_io),
+                    upstream_io,
+                    crate::ws::WsCaptureMeta {
+                        protocol,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                record_ws_har(
+                    &shared,
+                    &record_method,
+                    &record_path,
+                    result.stream.messages.len(),
+                );
+                if shared.verbose {
+                    println!(
+                        "ws relay complete: {} messages",
+                        result.stream.messages.len()
+                    );
+                }
+            }
+            (Err(e), _) => report(e.to_string()),
+            (_, Err(e)) => report(e.to_string()),
+        }
+    });
+    response
+}
+
+/// Minimal synchronous record of a completed WS session into the HAR store.
+fn record_ws_har(shared: &ProxyShared, method: &str, path: &str, messages: usize) {
+    let har_entry = build_har_entry(&HarEntryParts {
+        started_at_ms: chrono::Utc::now().timestamp_millis(),
+        time_ms: 0,
+        method,
+        url: path.to_string(),
+        request_headers: &HeaderMapValues::default(),
+        query_string: vec![],
+        request_content_type: None,
+        request_body_text: None,
+        status: 101,
+        response_headers: &Default::default(),
+        response_body: Some(format!(r#"{{"webSocketMessages":{messages}}}"#).as_bytes()),
+    });
+    shared.har.add_entry(har_entry);
+}
+
+/// The default path: pump upstream chunks to the client while teeing into
+/// the recording buffer; recording runs after the last chunk on the blocking
+/// pool, off the client's critical path.
+async fn stream_response(
+    shared: Arc<ProxyShared>,
+    upstream_response: reqwest::Response,
+    meta: RecordMeta,
+    passthrough_headers: HeaderMapValues,
+    status: http::StatusCode,
+) -> Response {
     let (mut tx, rx) = futures::channel::mpsc::channel::<
         std::result::Result<axum::body::Bytes, std::io::Error>,
     >(16);
-    let recorder = Arc::clone(&shared);
-    let record_method = method.to_string();
-    let record_body = request_body.clone();
-    let record_status = status.as_u16();
     tokio::spawn(async move {
         let mut buffer = Vec::new();
         let mut stream = upstream_response.bytes_stream();
@@ -174,37 +661,146 @@ async fn proxy_handler(State(shared): State<Arc<ProxyShared>>, req: Request) -> 
         drop(tx);
         // Recording is fully synchronous CPU work (schema inference, JSON
         // tree building, gzip decode). Run it on the blocking pool so it
-        // never occupies async worker threads: bursts of recording must not
-        // starve response polling under concurrency.
-        let recorder = Arc::clone(&recorder);
+        // never occupies async worker threads under concurrency.
         tokio::task::spawn_blocking(move || {
             record_exchange(
-                &recorder,
+                &shared,
                 RecordMeta {
-                    started_at_ms,
-                    time_ms: chrono::Utc::now().timestamp_millis() - started_at_ms,
-                    method: record_method,
-                    path,
-                    raw_query,
-                    request_headers,
-                    request_body: record_body,
-                    status: record_status,
-                    response_headers,
+                    time_ms: chrono::Utc::now().timestamp_millis() - meta.started_at_ms,
+                    ..meta
                 },
                 &buffer,
-            )
+            );
         });
     });
 
     let mut builder = Response::builder().status(status);
-    for (name, value) in &passthrough_headers {
-        builder = builder.header(name, value);
+    for (name, values) in &passthrough_headers {
+        if let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) {
+            for value in values {
+                if let Ok(hv) = http::HeaderValue::from_str(value) {
+                    builder = builder.header(header_name.clone(), hv);
+                }
+            }
+        }
     }
     builder
         .body(Body::from_stream(rx))
         .expect("build proxied response")
 }
 
+/// Buffered mode when response hooks are configured: the hook needs the full
+/// body, so read everything (bounded), run it, apply modifications, record,
+/// then answer from memory.
+async fn buffered_response_with_hook(
+    shared: Arc<ProxyShared>,
+    upstream_response: reqwest::Response,
+    mut meta: RecordMeta,
+    passthrough_headers: HeaderMapValues,
+) -> Response {
+    let mut body = Vec::new();
+    let mut stream = upstream_response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                body.extend_from_slice(&bytes);
+                if body.len() > MAX_REQUEST_BYTES * 8 {
+                    return plain_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "text/plain",
+                        "response exceeds buffered-hook limit",
+                    );
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let status = meta.status;
+    if let Some(hooks) = &shared.hooks {
+        let seq = shared.next_sequence();
+        let ctx = HookContext {
+            sequence: seq,
+            method: meta.method.clone(),
+            path: meta.path.clone(),
+            query: meta.raw_query.clone(),
+            headers: redacted_view(&meta.request_headers, &shared.policy),
+            body: Some(&body),
+        };
+        match run_response_hook(hooks, &ctx).await {
+            crate::rules::hooks::HookOutcome::Unchanged => {}
+            crate::rules::hooks::HookOutcome::Modified(modified) => {
+                modified.apply_headers(&mut meta.response_headers);
+                if let Some(new_body) = modified.decoded_body() {
+                    body = new_body;
+                }
+            }
+            crate::rules::hooks::HookOutcome::Drop => {
+                return plain_response(
+                    StatusCode::BAD_GATEWAY,
+                    "application/json",
+                    "{\"error\":\"dropped by response hook\"}",
+                );
+            }
+        }
+    }
+
+    meta.time_ms = chrono::Utc::now().timestamp_millis() - meta.started_at_ms;
+    let recorder = Arc::clone(&shared);
+    let m = meta.clone();
+    let b = body.clone();
+    tokio::task::spawn_blocking(move || record_exchange(&recorder, m, &b));
+
+    let mut builder = Response::builder().status(
+        http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    for (name, values) in &passthrough_headers {
+        if let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) {
+            for value in values {
+                if let Ok(hv) = http::HeaderValue::from_str(value) {
+                    builder = builder.header(header_name.clone(), hv);
+                }
+            }
+        }
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", ""))
+}
+
+/// Connection-teardown fault: a body stream that fails immediately makes
+/// hyper abort the response mid-flight (the closest a handler can get to an
+/// RST without transport control).
+fn reset_connection_response() -> Response {
+    use futures::stream::once;
+    let failing = once(async {
+        Err::<axum::body::Bytes, std::io::Error>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "fault injected",
+        ))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from_stream(failing))
+        .unwrap_or_else(|_| plain_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", ""))
+}
+
+/// Redacted view of headers for hook payloads: credential values are masked
+/// in place, names and counts preserved.
+fn redacted_view(headers: &HeaderMapValues, policy: &RedactionPolicy) -> HeaderMapValues {
+    headers
+        .iter()
+        .map(|(name, values)| {
+            if policy.should_redact_header(name) {
+                (name.clone(), vec![REDACTED_VALUE.to_string(); values.len()])
+            } else {
+                (name.clone(), values.clone())
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone)]
 struct RecordMeta {
     started_at_ms: i64,
     time_ms: i64,
@@ -631,4 +1227,42 @@ mod tests {
         assert!(shared.openapi.all_endpoints().is_empty());
         assert_eq!(shared.har.entry_count(), 0);
     }
+}
+
+#[allow(dead_code)]
+fn _send_probe(shared: Arc<ProxyShared>, req: Request) {
+    fn assert_send<F: std::future::Future + Send>(f: F) -> F {
+        f
+    }
+    let _ = assert_send(handle_request(shared, req));
+}
+
+#[allow(dead_code)]
+fn _send_probe2(
+    shared: Arc<ProxyShared>,
+    authority: String,
+    mut decrypted: http::Request<hyper::body::Incoming>,
+) {
+    fn require_send<F: std::future::Future + Send>(f: F) -> F {
+        f
+    }
+    let _ = require_send(async move {
+        let path_q = decrypted
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let absolute = format!("https://{authority}{path_q}");
+        if let Ok(u) = absolute.parse() {
+            *decrypted.uri_mut() = u;
+        }
+        let decrypted = decrypted.map(axum::body::Body::new);
+        handle_request(shared, decrypted).await
+    });
+}
+
+#[allow(dead_code)]
+fn _sync_probe() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<ProxyShared>();
 }

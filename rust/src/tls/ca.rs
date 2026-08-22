@@ -217,9 +217,7 @@ fn ca_generation_error(e: rcgen::Error) -> Error {
 /// exclusively on what is in their trust store.
 pub(crate) fn issuer_certificate(ca_key_pair: &KeyPair) -> Result<rcgen::Certificate> {
     let params = ca_params()?;
-    params
-        .self_signed(ca_key_pair)
-        .map_err(ca_generation_error)
+    params.self_signed(ca_key_pair).map_err(ca_generation_error)
 }
 
 /// Persist the pair: directory 0700, files 0600 (permission hardening is a

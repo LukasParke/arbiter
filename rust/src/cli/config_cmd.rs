@@ -13,7 +13,7 @@
 #[cfg(test)]
 use std::path::Path;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 use crate::cli::output::{emit, OutputFormat};
 use crate::config::{self, FileConfig};
@@ -32,6 +32,14 @@ pub enum ConfigCommand {
     /// Print the effective layered configuration as JSON
     /// (defaults merged under the config file, environment applied on top).
     Show,
+}
+
+/// clap wrapper making [`ConfigCommand`] usable as a subcommand payload
+/// (clap requires `Args`, not `Subcommand`, for nested payloads).
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
 }
 
 /// Dispatch `arbiter config <sub>`.

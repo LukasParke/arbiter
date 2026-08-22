@@ -369,3 +369,14 @@ mod tests {
         assert!(g.iter().all(|b| b.is_ascii_hexdigit()));
     }
 }
+
+impl Clone for FaultInjector {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            state: std::sync::atomic::AtomicU64::new(
+                self.state.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}

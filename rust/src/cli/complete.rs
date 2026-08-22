@@ -5,15 +5,10 @@
 //! install hint goes to stderr so piping the script to a file is never
 //! polluted.
 //!
-//! # Integration seam (M3d)
-//!
-//! [`build_cli`] below returns a MINIMAL placeholder root command so that
-//! completions are generated and testable before assembly. In the M3d window
-//! cli-dx replaces it with the real assembled root (the same
-//! `clap::Command` built from `cli::mod`'s derive parser), consuming the typed
-//! surfaces from tls-intercept / mock-engine / validate-proxy per AMEND-11.
-//! Only [`generate`] + [`build_cli`] are consumed by the `complete`
-//! subcommand registration; nothing else here survives assembly.
+//! Assembled at M3d: [`build_cli`] returns the REAL root command
+//! (`crate::cli::root_command()`), so completions cover every registered
+//! subcommand and flag — including the typed surfaces flattened into `start`
+//! per AMEND-11.
 
 use std::io::Write;
 
@@ -25,6 +20,25 @@ pub const BIN_NAME: &str = "arbiter";
 
 /// All shells `arbiter complete` accepts.
 pub const SUPPORTED_SHELLS: [Shell; 4] = [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell];
+
+/// `arbiter complete <shell>`
+#[derive(Debug, clap::Parser)]
+pub struct CompleteArgs {
+    /// Shell to generate completions for.
+    pub shell: Shell,
+}
+
+/// Run the command, returning the process exit code.
+pub fn run(args: &CompleteArgs) -> i32 {
+    match generate(args.shell, &mut build_cli()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: completion generation failed: {e}");
+            eprintln!("  help: check that stdout is writable and retry");
+            1
+        }
+    }
+}
 
 /// Generate completions for `shell` from `cmd` and write them to stdout,
 /// followed by one stderr install hint for the shell.
@@ -62,59 +76,11 @@ pub fn print_install_hint(shell: Shell) {
     eprintln!("{hint}");
 }
 
-/// SEAM (M3d): placeholder root command. Returns the minimal current root with
-/// the subcommands that exist today (`ca`, `mock`, `tui`, `fingerprint`,
-/// `config`, `complete`) so generated completions are real and testable now.
-/// Replaced by the fully assembled root command during M3d — swap this body,
-/// keep the signature.
+/// The real root command (M3d assembly): the same `clap::Command` the
+/// top-level parser builds, so generated completions always match the live
+/// CLI surface.
 pub fn build_cli() -> Command {
-    Command::new(BIN_NAME)
-        .version(crate::version::ARBITER_VERSION)
-        .about("API proxy with OpenAPI generation, exact capture/replay, and HAR export")
-        .subcommand(
-            Command::new("ca").about("Generate and manage the local TLS certificate authority"),
-        )
-        .subcommand(
-            Command::new("mock")
-                .about("Serve mocked API responses from captures or an OpenAPI spec"),
-        )
-        .subcommand(
-            Command::new("tui")
-                .about("Interactive terminal UI for live or captured flows")
-                .arg(
-                    clap::Arg::new("port")
-                        .short('p')
-                        .long("port")
-                        .value_name("PORT")
-                        .help("Attach to a running arbiter instance on this port"),
-                ),
-        )
-        .subcommand(
-            Command::new("fingerprint")
-                .about("Classify LLM traffic in a capture bundle and report schema drift")
-                .arg(clap::Arg::new("bundle").value_name("BUNDLE_DIR")),
-        )
-        .subcommand(
-            Command::new("config")
-                .about("Inspect and initialize the arbiter config file")
-                .subcommands([
-                    Command::new("init").about("Write a commented starter config.toml"),
-                    Command::new("show").about("Print the effective layered configuration as JSON"),
-                    Command::new("path").about("Print the resolved config file path"),
-                ]),
-        )
-        .subcommand(
-            Command::new("complete")
-                .about("Generate shell completions")
-                .arg(
-                    clap::Arg::new("shell")
-                        .value_name("SHELL")
-                        .required(true)
-                        .value_parser(clap::builder::EnumValueParser::<Shell>::new())
-                        .help("Shell to generate completions for"),
-                ),
-        )
-        .subcommand_required(false)
+    crate::cli::root_command()
 }
 
 #[cfg(test)]
