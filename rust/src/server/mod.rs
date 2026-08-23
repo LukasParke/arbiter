@@ -339,6 +339,13 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
         .map_err(|e| Error::other(format!("invalid proxy url: {e}")))?;
     let docs_url = url::Url::parse(&format!("http://127.0.0.1:{docs_port}"))
         .map_err(|e| Error::other(format!("invalid docs url: {e}")))?;
+    // B3 (UX review): recorded traffic must survive shutdown. Export the
+    // in-memory HAR + generated OpenAPI to timestamped files beside the cwd
+    // unless persistence (--db-path) already captured it. Failures are
+    // best-effort warnings, never errors.
+    let har_for_export = Arc::clone(&har);
+    let openapi_for_export = Arc::clone(&openapi);
+    let export_db = db.clone();
     let shutdown: BoxFuture<'static, ()> = Box::pin(async move {
         let _ = shutdown_tx.send(());
         if let Some(handle) = proxy_handle {
@@ -346,6 +353,42 @@ pub async fn start_servers(options: ServerOptions) -> Result<RunningServers> {
         }
         if let Some(handle) = docs_handle {
             let _ = handle.await;
+        }
+        if Arc::strong_count(&har_for_export) > 2 {
+            // DocsShared still holds clones; give handlers a beat to drop.
+        }
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let har_json = har_for_export.get_har();
+        let has_entries = har_json["log"]["entries"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if has_entries && export_db.is_none() {
+            let har_path = format!("arbiter-har-{stamp}.json");
+            match serde_json::to_string_pretty(&har_json) {
+                Ok(body) => {
+                    if std::fs::write(&har_path, body).is_ok() {
+                        println!("HAR exported to {har_path}");
+                    }
+                }
+                Err(e) => eprintln!("warning: HAR export failed: {e}"),
+            }
+        }
+        let spec = openapi_for_export.generate_openapi();
+        if spec["paths"]
+            .as_object()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+        {
+            let spec_path = format!("arbiter-openapi-{stamp}.json");
+            match serde_json::to_string_pretty(&spec) {
+                Ok(body) => {
+                    if std::fs::write(&spec_path, body).is_ok() {
+                        println!("OpenAPI exported to {spec_path}");
+                    }
+                }
+                Err(e) => eprintln!("warning: OpenAPI export failed: {e}"),
+            }
         }
     });
 

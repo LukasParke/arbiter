@@ -67,11 +67,71 @@ pub struct CaptureArgs {
     /// write a machine-readable final report on shutdown
     #[arg(long = "report")]
     pub report: Option<String>,
+
+    /// overwrite a non-empty --output directory
+    #[arg(long = "force")]
+    pub force: bool,
 }
 
-pub fn run(args: &CaptureArgs) -> i32 {
+pub fn run(args: &CaptureArgs, fmt: crate::cli::output::OutputFormat) -> i32 {
     let runtime = tokio::runtime::Runtime::new().expect("start tokio runtime");
-    runtime.block_on(run_async(args.clone()))
+    let code = runtime.block_on(run_async(args.clone()));
+    if code == 0 {
+        if let Some(result) = last_export() {
+            crate::cli::output::emit(
+                fmt,
+                || {
+                    println!(
+                        "Exported {} exchange(s) to {}",
+                        result.manifest.exchange_count,
+                        result.output_dir.display()
+                    )
+                },
+                serde_json::json!({
+                    "schema": "arbiter.capture-summary/v1",
+                    "outputDir": result.output_dir,
+                    "exchangeCount": result.manifest.exchange_count,
+                    "bundleDigest": result.manifest.bundle_digest,
+                }),
+            );
+        }
+    }
+    code
+}
+
+thread_local! {
+    static LAST_EXPORT: std::cell::RefCell<Option<crate::capture::ExportResult>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn remember_export(result: crate::capture::ExportResult) {
+    LAST_EXPORT.with(|cell| *cell.borrow_mut() = Some(result));
+}
+
+fn last_export() -> Option<crate::capture::ExportResult> {
+    LAST_EXPORT.with(|cell| cell.borrow().clone())
+}
+
+/// B2: a capture bundle directory must never be silently overwritten.
+/// Refuse when the path exists with content (or exists as a plain file)
+/// unless `--force` was passed; an empty existing directory or an absent
+/// path is fine.
+fn ensure_output_writable(output: &str, force: bool) -> Result<(), String> {
+    let path = std::path::Path::new(output);
+    if !path.exists() || force {
+        return Ok(());
+    }
+    let empty = path.is_dir()
+        && path
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+    if empty {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to overwrite existing bundle directory '{output}'\n  help: choose a new --output, remove it, or pass --force"
+    ))
 }
 
 async fn run_async(args: CaptureArgs) -> i32 {
@@ -105,6 +165,12 @@ async fn run_async(args: CaptureArgs) -> i32 {
         ))
     });
 
+    // B2: fail fast, before any listener binds, when --output would clobber
+    // an existing non-empty directory without --force.
+    if let Err(message) = ensure_output_writable(&args.output, args.force) {
+        fail(message);
+    }
+
     let mode = if args.exact {
         CaptureMode::Exact
     } else {
@@ -125,6 +191,9 @@ async fn run_async(args: CaptureArgs) -> i32 {
         redaction,
         max_body_bytes: Some(max_body_bytes),
         idle_timeout_ms,
+        // Session-level output so ANY shutdown path (idle watchdog, signal)
+        // exports the bundle to the user's chosen directory.
+        output: Some(std::path::PathBuf::from(&args.output)),
         ..CaptureSessionOptions::default()
     })
     .await
@@ -224,18 +293,19 @@ async fn shutdown(session: crate::capture::CaptureSession, code: u32, ctx: Shutd
         "error": serde_json::Value::Null,
     });
 
-    let export = async {
-        session.wait_for_idle().await;
-        session
-            .export(Some(ExportOptions {
-                output: ctx.output.clone(),
-                reject_secrets: ctx.reject_secrets.clone(),
-                allow_binary_media_types: ctx.allow_binary_media_types.clone(),
-            }))
-            .await
-    };
-    match export.await {
+    // B1: close() enforces the shutdown grace itself — in-flight exchanges
+    // past the deadline are finalized as partial captures and the bundle is
+    // always written, so a hung upstream can never lose the recording.
+    match session
+        .close_with_export(Some(ExportOptions {
+            output: ctx.output.clone(),
+            reject_secrets: ctx.reject_secrets.clone(),
+            allow_binary_media_types: ctx.allow_binary_media_types.clone(),
+        }))
+        .await
+    {
         Ok(result) => {
+            remember_export(result.clone());
             report["bundle"] = json!({
                 "path": absolute_path(&result.output_dir).to_string_lossy(),
                 "exchangeCount": result.manifest.exchange_count,
@@ -246,6 +316,12 @@ async fn shutdown(session: crate::capture::CaptureSession, code: u32, ctx: Shutd
                 result.manifest.exchange_count,
                 ctx.output.display()
             );
+            if result.interrupted_exchanges > 0 {
+                eprintln!(
+                    "warning: {} exchange(s) finalized as incomplete due to interrupt",
+                    result.interrupted_exchanges
+                );
+            }
         }
         Err(e) => {
             report["error"] = json!(e.to_string());
@@ -253,8 +329,6 @@ async fn shutdown(session: crate::capture::CaptureSession, code: u32, ctx: Shutd
             exit_code = 1;
         }
     }
-
-    session.close().await.ok();
 
     if let Some(report_path) = &ctx.report_path {
         let serialized = serde_json::to_vec_pretty(&report).expect("report serializes");
@@ -267,4 +341,68 @@ async fn shutdown(session: crate::capture::CaptureSession, code: u32, ctx: Shutd
     }
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_guard_refuses_populated_dir_without_force() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), b"{}").expect("seed entry");
+        let error = ensure_output_writable(dir.path().to_str().expect("utf8 tempdir"), false)
+            .expect_err("populated dir refused");
+        assert!(error.contains("refusing to overwrite existing bundle directory"));
+        assert!(error.contains("pass --force"));
+    }
+
+    #[test]
+    fn output_guard_refuses_plain_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("bundle");
+        std::fs::write(&file, b"not a directory").expect("seed file");
+        assert!(ensure_output_writable(file.to_str().expect("utf8"), false).is_err());
+    }
+
+    #[test]
+    fn output_guard_allows_force_absent_and_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let populated = dir.path().join("populated");
+        std::fs::create_dir(&populated).expect("mkdir");
+        std::fs::write(populated.join("exchanges.ndjson"), b"").expect("seed entry");
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).expect("mkdir");
+        let absent = dir.path().join("absent");
+
+        // --force overrides even a populated directory.
+        assert!(ensure_output_writable(populated.to_str().expect("utf8"), true).is_ok());
+        // An empty existing directory is fine without --force.
+        assert!(ensure_output_writable(empty.to_str().expect("utf8"), false).is_ok());
+        // An absent path is fine.
+        assert!(ensure_output_writable(absent.to_str().expect("utf8"), false).is_ok());
+    }
+
+    #[test]
+    fn force_flag_parses_and_defaults_false() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "capture",
+                "--target",
+                "http://127.0.0.1",
+                "--output",
+                "/tmp/b",
+            ];
+            argv.extend_from_slice(extra);
+            let command = <CaptureArgs as clap::Args>::augment_args(clap::Command::new("capture"));
+            let matches = command
+                .try_get_matches_from(argv)
+                .expect("capture args parse");
+            <CaptureArgs as clap::FromArgMatches>::from_arg_matches(&matches)
+                .expect("arg round-trip")
+        };
+
+        assert!(!parse(&[]).force);
+        assert!(parse(&["--force"]).force);
+    }
 }

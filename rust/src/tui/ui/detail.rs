@@ -150,12 +150,19 @@ fn header_pairs(
         .collect()
 }
 
-/// Renders the flow-detail screen for the selected sequence.
-pub(crate) fn draw_detail(f: &mut Frame, app: &App) {
+/// Renders the flow-detail screen for the selected sequence. Feeds the
+/// real body-pane height back into the app so half-page scrolls and
+/// clamping track the live viewport (B5).
+pub(crate) fn draw_detail(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let [header_area, content_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(5)]).areas(area);
 
+    // The response pane is the primary scroll surface; report its row
+    // budget (borders + title + footer allowance) before borrowing detail.
+    if app.detail.is_some() {
+        app.note_body_viewport(content_area.height.saturating_sub(6) as usize);
+    }
     match app.detail.as_ref() {
         Some(detail) => {
             draw_header(f, header_area, detail);
@@ -172,6 +179,17 @@ pub(crate) fn draw_detail(f: &mut Frame, app: &App) {
             );
         }
     }
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let w = area.width * width_percent / 100;
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    )
 }
 
 fn draw_header(f: &mut Frame, area: Rect, detail: &FlowDetailDto) {
@@ -322,38 +340,84 @@ fn render_body_view(
 
     // Virtualize: only materialize the visible window of lines.
     let all_lines: Vec<&str> = prepared.lines().collect();
+    let total = all_lines.len();
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let scroll = app.body_scroll.min(all_lines.len().saturating_sub(1));
-    let end = (scroll + visible_rows.max(1)).min(all_lines.len());
-    let styled: Vec<Line> = all_lines[scroll..end]
+    let scrollable = total > visible_rows.max(1);
+    // Reserve one footer row for the `line X–Y of N` indicator.
+    let para_rows = if scrollable {
+        visible_rows.max(1)
+    } else {
+        area.height.saturating_sub(2) as usize
+    };
+    let (start, end) = app.body_scroll_window(total, para_rows);
+    let styled: Vec<Line> = all_lines[start..end]
         .iter()
         .map(|line| Line::from(highlight_json_line(line)))
         .collect();
 
+    let [para_area, footer_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(scrollable)),
+    ])
+    .areas(area);
     f.render_widget(
         Paragraph::new(styled)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::TOP).title(full_title)),
-        area,
+        para_area,
     );
+    if scrollable {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("line {}–{} of {total}", start + 1, end),
+                Style::default().fg(Color::DarkGray),
+            )),
+            footer_area,
+        );
+    }
 }
 
-/// Renders help / palette overlays on top of the current screen.
+/// Renders help / palette / export-confirm overlays on top of the current
+/// screen.
 pub(crate) fn draw_overlay(f: &mut Frame, app: &App) {
+    // Overwrite confirmation reuses the palette styling (B6).
+    if let Some(path) = app.pending_export_path() {
+        let area = centered_rect(f.area(), 70, 5);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("export target {} already exists", path.display())),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("overwrite? (y/n) ", Style::default().fg(Color::Cyan)),
+                    Span::styled("y proceed · n cancel", Style::default().fg(Color::DarkGray)),
+                ]),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("export")),
+            area,
+        );
+        return;
+    }
     match app.screen {
         Screen::Help => {
-            let text = vec![
+            let mut text = vec![
                 Line::from("Arbiter TUI — keys"),
-                Line::from("q quit · / filter · enter open detail · esc back"),
-                Line::from("j/k or arrows move · PgUp/PgDn page · g/G top/bottom"),
+                Line::from(
+                    "q quit · Ctrl+C quit from anywhere · / filter · enter open detail · esc back",
+                ),
+                Line::from("list: j/k or arrows move · PgUp/PgDn page · g/G top/bottom"),
+                Line::from(
+                    "detail: j/k or arrows scroll body · PgUp/PgDn half page · Home/End jump",
+                ),
                 Line::from("r replay (y/n confirm) · x delete (y/n confirm)"),
                 Line::from("w export HAR · p pretty-print · R raw toggle"),
                 Line::from(
                     ": palette — save NAME · load NAME · filters · attach URL · export PATH",
                 ),
                 Line::from("? toggle this help"),
+                Line::from(""),
             ];
-            let area = centered_rect(f.area(), 70, text.len() as u16 + 2);
+            text.extend(crate::tui::filter::FILTER_HELP.lines().map(Line::from));
+            let area = centered_rect(f.area(), 90, text.len() as u16 + 2);
             f.render_widget(
                 Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("help")),
                 area,
@@ -377,17 +441,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &App) {
         }
         _ => {}
     }
-}
-
-fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
-    let w = area.width * width_percent / 100;
-    let h = height.min(area.height);
-    Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    )
 }
 
 #[cfg(test)]

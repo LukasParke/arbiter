@@ -19,12 +19,9 @@ const MODES: [&str; 4] = [
 /// Replay a capture bundle (or legacy traffic JSONL) for regression testing
 #[derive(Args)]
 pub struct ReplayArgs {
-    /// path to a capture bundle directory
+    /// capture bundle directory (unified input convention: the primary
+    /// input is the `[INPUT]` positional)
     pub bundle: Option<String>,
-
-    /// legacy alias for the capture path
-    #[arg(short = 'i', long = "input")]
-    pub input: Option<String>,
 
     /// treat the input as legacy traffic JSONL instead of a bundle
     #[arg(long = "legacy-jsonl")]
@@ -75,11 +72,11 @@ pub struct ReplayArgs {
     pub verbose: bool,
 }
 
-pub fn run(args: &ReplayArgs) -> i32 {
-    let input_path = match args.bundle.as_deref().or(args.input.as_deref()) {
-        Some(path) => path.to_string(),
-        None => fail("Provide a capture bundle directory (or --input <path>)"),
+pub fn run(args: &ReplayArgs, fmt: super::output::OutputFormat) -> i32 {
+    let Some(input_path) = args.bundle.as_deref() else {
+        fail("Provide a capture bundle directory (positional [INPUT])");
     };
+    let input_path = input_path.to_string();
     let input = Path::new(&input_path);
     if !input.exists() {
         fail(format!("Capture path not found: {input_path}"));
@@ -181,33 +178,46 @@ pub fn run(args: &ReplayArgs) -> i32 {
     };
 
     let total = report.results.len();
-    println!("\nReplay Report:");
-    println!("  Total:   {total}");
-    println!("  Passed:  {}", report.matched);
-    println!("  Failed:  {}", report.diffed);
-    println!("  Errors:  {}", count_errors(&report.results));
+    let stamped_report = super::output::stamped(super::output::SCHEMA_REPLAY_REPORT, &report);
+    super::output::emit(
+        fmt,
+        || {
+            println!("\nReplay Report:");
+            println!("  Total:   {total}");
+            println!("  Passed:  {}", report.matched);
+            println!("  Failed:  {}", report.diffed);
+            println!("  Errors:  {}", count_errors(&report.results));
 
-    for result in &report.results {
-        match &result.outcome {
-            crate::replay::ReplayOutcome::Match => {
-                if args.verbose {
-                    println!("✓ #{}", result.sequence);
+            for result in &report.results {
+                match &result.outcome {
+                    crate::replay::ReplayOutcome::Match => {
+                        if args.verbose {
+                            println!("✓ #{}", result.sequence);
+                        }
+                    }
+                    crate::replay::ReplayOutcome::Diff { detail } => {
+                        println!("⚠ #{} — {detail}", result.sequence);
+                    }
+                    crate::replay::ReplayOutcome::Unreplayable { reason } => {
+                        println!("⚠ #{} — {reason}", result.sequence);
+                    }
+                    crate::replay::ReplayOutcome::Error { message } => {
+                        println!("✗ #{} — {message}", result.sequence);
+                    }
                 }
             }
-            crate::replay::ReplayOutcome::Diff { detail } => {
-                println!("⚠ #{} — {detail}", result.sequence);
-            }
-            crate::replay::ReplayOutcome::Unreplayable { reason } => {
-                println!("⚠ #{} — {reason}", result.sequence);
-            }
-            crate::replay::ReplayOutcome::Error { message } => {
-                println!("✗ #{} — {message}", result.sequence);
-            }
-        }
-    }
+        },
+        &stamped_report,
+    );
 
     if let Some(report_path) = args.report.as_deref() {
-        let serialized = serde_json::to_vec_pretty(&report).expect("replay report serializes");
+        // stamped_view keeps "schema" as the literal first key of the
+        // written artifact.
+        let serialized = serde_json::to_vec_pretty(&super::output::stamped_view(
+            super::output::SCHEMA_REPLAY_REPORT,
+            &report,
+        ))
+        .expect("replay report serializes");
         atomic_write_private(Path::new(report_path), &serialized).unwrap_or_else(|e| {
             fail(format!("Failed to write report {report_path}: {e}"));
         });
@@ -312,4 +322,47 @@ fn count_errors(results: &[crate::replay::ReplayExchangeResult]) -> usize {
         .iter()
         .filter(|r| matches!(r.outcome, crate::replay::ReplayOutcome::Error { .. }))
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::output::{stamped, SCHEMA_REPLAY_REPORT};
+    use crate::replay::{ReplayExchangeResult, ReplayMode, ReplayOutcome, ReplayReport};
+
+    /// G4 + D4 regression: the replay report emits as valid JSON carrying
+    /// the exact versioned schema discriminator, and round-trips.
+    #[test]
+    fn json_report_is_stamped_and_round_trips() {
+        let report = ReplayReport {
+            mode: ReplayMode::StatusOnly,
+            results: vec![ReplayExchangeResult {
+                sequence: 1,
+                outcome: ReplayOutcome::Match,
+            }],
+            matched: 1,
+            diffed: 0,
+        };
+        let stamped_report = stamped(SCHEMA_REPLAY_REPORT, &report);
+        assert_eq!(
+            stamped_report.get("schema").and_then(|s| s.as_str()),
+            Some("arbiter.replay-report/v1")
+        );
+
+        // Full JSON round-trip (what `--json` consumers do).
+        let text = serde_json::to_string(&stamped_report).expect("serialize");
+        let back: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back["schema"], "arbiter.replay-report/v1");
+        assert_eq!(back["matched"], 1);
+        // The written --report artifact keeps "schema" as its literal
+        // first key (struct field order in the pretty writer).
+        let pretty = serde_json::to_string_pretty(&super::super::output::stamped_view(
+            SCHEMA_REPLAY_REPORT,
+            &report,
+        ))
+        .expect("pretty");
+        assert!(
+            pretty.starts_with("{\n  \"schema\":"),
+            "schema must be first key: {pretty}"
+        );
+    }
 }

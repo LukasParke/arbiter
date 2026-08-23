@@ -745,6 +745,7 @@ mod tests {
             validation: None,
             max_body_bytes: None,
             idle_timeout_ms: None,
+            shutdown_grace_ms: None,
         };
         let server =
             start_test_gateway(test_policy(&upstream), None, Some(leaky), Some(capture)).await;
@@ -781,6 +782,7 @@ mod tests {
             validation: None,
             max_body_bytes: None,
             idle_timeout_ms: None,
+            shutdown_grace_ms: None,
         };
         let server =
             start_test_gateway(test_policy(&upstream), None, Some(sane), Some(capture_ok)).await;

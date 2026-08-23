@@ -26,19 +26,24 @@ pub struct FingerprintCommand {
     pub json: bool,
 }
 
-/// Run the command, returning the process exit code. Errors print in the
-/// house style: one-line cause plus a `help:` hint, never a panic.
-pub fn run(args: &FingerprintCommand) -> i32 {
+/// Run the command, returning the process exit code. `global_json` is the
+/// root `--json` flag; the command's own local `--json` forces JSON too.
+/// Errors print in the house style: one-line cause plus a `help:` hint,
+/// never a panic.
+pub fn run(args: &FingerprintCommand, global_fmt: super::output::OutputFormat) -> i32 {
+    use super::output::OutputFormat;
+    let fmt = if args.json {
+        OutputFormat::Json
+    } else {
+        global_fmt
+    };
     match fingerprint_bundle(&args.bundle) {
         Ok(report) => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).expect("report serializes")
-                );
-            } else {
-                print_table(&report);
-            }
+            super::output::emit(
+                fmt,
+                || print_table(&report),
+                super::output::stamped(super::output::SCHEMA_FINGERPRINT, &report),
+            );
             0
         }
         Err(error) => {
@@ -207,5 +212,22 @@ mod tests {
         let text = help.render_long_help().to_string();
         assert!(text.contains("Examples"));
         assert!(text.contains("--json"));
+    }
+
+    /// D4 regression: the emitted report carries the versioned schema
+    /// discriminator.
+    #[test]
+    fn json_report_is_stamped_with_schema() {
+        let report = FingerprintReport {
+            entries: vec![],
+            drift_groups: vec![],
+            note: None,
+        };
+        let value =
+            super::super::output::stamped(super::super::output::SCHEMA_FINGERPRINT, &report);
+        assert_eq!(
+            value.get("schema").and_then(|s| s.as_str()),
+            Some(super::super::output::SCHEMA_FINGERPRINT)
+        );
     }
 }

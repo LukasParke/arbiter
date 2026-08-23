@@ -27,9 +27,23 @@ Arbiter is a powerful API proxy and documentation generator that automatically c
 
 ### Installation
 
+**TypeScript package (published):**
+
 ```bash
 npm install -g @parke.dev/arbiter
 ```
+
+**Rust binary (this repository, `rust/`):**
+
+```bash
+cargo install --path rust
+# or build directly:
+cargo build --release --manifest-path rust/Cargo.toml   # -> rust/target/release/arbiter
+```
+
+The Rust binary implements the same proxy/capture/replay surface plus TLS
+interception, WebSocket capture, a mock server, live validation, and a TUI —
+see [rust/README.md](rust/README.md).
 
 ### Basic Usage
 

@@ -13,6 +13,54 @@ use super::{atomic_write_private, fail, parse_positive_int};
 use crate::capture::{CaptureMode, CaptureSessionOptions};
 use crate::gateway::{start_gateway, CredentialProvider, GatewayOptions, GatewayPolicy};
 
+/// Long help (`--help`) for `arbiter gateway`, including the full
+/// POLICY SCHEMA reference (D2). The embedded example JSON is deserialized
+/// and validated by a test below so the docs cannot drift from
+/// [`crate::gateway::GatewayPolicy`]. Applied at the `Command::Gateway`
+/// variant in `cli/mod.rs` (the variant doc comment would otherwise win).
+pub(crate) const LONG_ABOUT: &str = r#"Run a credential-injecting gateway for untrusted clients
+
+The gateway sits between an untrusted client and your upstream API. Every
+request must present the opaque token; the policy file governs what that
+token may do. The token itself is never stored — only its sha256 pin
+(tokenSha256).
+
+POLICY SCHEMA
+
+The --policy file is a single JSON object (camelCase keys):
+
+  tokenSha256      string   REQUIRED sha256 hex digest (64 hex chars) of
+                            the opaque client token
+  expiresAt        string?  ISO-8601/RFC-3339 expiry for the token; null or
+                            absent disables expiry
+  targetOrigin     string   REQUIRED allowed upstream origin, e.g.
+                            "https://api.anthropic.com" (exact scheme://host[:port])
+  methods          string[] REQUIRED allowed request methods (exact,
+                            uppercase), e.g. ["POST", "GET"]
+  pathPrefixes     string[] REQUIRED allowed path prefixes using segment
+                            semantics ("/v1" matches /v1/... but never
+                            /v1secrets or encoded traversal)
+  models           string[] when non-empty, JSON request bodies must carry
+                            one of these "model" values
+  maxRequestBytes  u64      REQUIRED per-request body byte ceiling (> 0)
+  maxTotalBytes    u64      REQUIRED cumulative response byte ceiling for
+                            the session (> 0)
+  maxDurationSecs  u64      REQUIRED session duration ceiling in seconds (> 0)
+
+Complete example (validates as-is):
+
+{
+  "tokenSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "expiresAt": "2026-12-31T23:59:59Z",
+  "targetOrigin": "https://api.anthropic.com",
+  "methods": ["POST", "GET"],
+  "pathPrefixes": ["/v1/messages", "/v1/models"],
+  "models": ["claude-sonnet-4"],
+  "maxRequestBytes": 1048576,
+  "maxTotalBytes": 104857600,
+  "maxDurationSecs": 3600
+}"#;
+
 /// Run a credential-injecting gateway for untrusted clients
 #[derive(Args, Clone)]
 pub struct GatewayArgs {
@@ -232,5 +280,48 @@ fn log_request_event(event: &crate::gateway::GatewayRequestEvent) {
         (Some(reason), false) => println!("{mark} {} {status} denied: {reason}", event.sequence),
         (_, true) => println!("{mark} {} {status}", event.sequence),
         (None, false) => println!("{mark} {} {status} denied", event.sequence),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D2 regression: the POLICY SCHEMA example embedded in `--help` must
+    /// deserialize into GatewayPolicy and pass validation, so the docs can
+    /// never drift from the struct.
+    #[test]
+    fn help_policy_example_deserializes_and_validates() {
+        let start = LONG_ABOUT.find('{').expect("example object present");
+        let end = LONG_ABOUT.rfind('}').expect("example object closed");
+        let policy: crate::gateway::GatewayPolicy = serde_json::from_str(&LONG_ABOUT[start..=end])
+            .expect("help example must be valid JSON");
+        crate::gateway::validate_policy(&policy).expect("help example must validate");
+    }
+    /// D2 regression: `--help` renders the POLICY SCHEMA section.
+    #[test]
+    fn long_help_documents_policy_schema() {
+        // long_about is attached at the Command::Gateway variant in
+        // cli/mod.rs, so render through the assembled root command.
+        let mut sub = crate::cli::root_command()
+            .get_subcommands()
+            .find(|c| c.get_name() == "gateway")
+            .cloned()
+            .expect("gateway registered in root command");
+        let text = sub.render_long_help().to_string();
+        assert!(text.contains("POLICY SCHEMA"), "long help lost schema docs");
+        for field in [
+            "tokenSha256",
+            "expiresAt",
+            "targetOrigin",
+            "methods",
+            "pathPrefixes",
+            "models",
+            "maxRequestBytes",
+            "maxTotalBytes",
+            "maxDurationSecs",
+        ] {
+            assert!(text.contains(field), "policy doc missing {field}");
+        }
     }
 }
