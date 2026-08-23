@@ -8,7 +8,7 @@
 //! Mounted by cli-dx at assembly alongside `/__violations` and
 //! `/__mock/health`; also usable standalone in tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -77,12 +77,21 @@ pub trait FlowsBackend: Send + Sync + 'static {
 
 /// Bridges the HTTP surface onto a live capture session. `target` is the
 /// upstream origin single-exchange replays are re-sent against.
+///
+/// Deleted sequences are recorded in an API-level tombstone set so listings,
+/// detail, and replay keep answering as if the flow were gone even though
+/// the underlying session store is owned elsewhere. Sequences remain
+/// stable forever: deletes never renumber later flows.
 pub struct SessionFlowsBackend {
     session: Arc<CaptureSession>,
     target: Url,
     /// High-water mark backing [`FlowsBackend::latest_seq`] without a full
     /// scan.
     high_water: Mutex<u64>,
+    /// Tombstoned sequences (deleted via this API). Kept here — not in the
+    /// capture session — so the delete contract survives independent of the
+    /// session's own retention behavior.
+    deleted: std::sync::Mutex<HashSet<u64>>,
 }
 
 impl SessionFlowsBackend {
@@ -91,7 +100,19 @@ impl SessionFlowsBackend {
             session,
             target,
             high_water: Mutex::new(0),
+            deleted: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    fn is_deleted(&self, seq: u64) -> bool {
+        self.deleted
+            .lock()
+            .expect("deleted seqs lock")
+            .contains(&seq)
+    }
+
+    fn mark_deleted(&self, seq: u64) {
+        self.deleted.lock().expect("deleted seqs lock").insert(seq);
     }
 
     fn blob_lookup(bodies: &HashMap<String, Vec<u8>>, body: &CapturedBody) -> Option<Vec<u8>> {
@@ -114,6 +135,7 @@ impl FlowsBackend for SessionFlowsBackend {
                 .await
                 .iter()
                 .map(summary_dto_from_session)
+                .filter(|summary| !self.is_deleted(summary.sequence))
                 .collect()
         })
     }
@@ -130,6 +152,9 @@ impl FlowsBackend for SessionFlowsBackend {
 
     fn detail<'a>(&'a self, seq: u64) -> BoxFuture<'a, Option<FlowDetailDto>> {
         Box::pin(async move {
+            if self.is_deleted(seq) {
+                return None;
+            }
             let exchange = self
                 .session
                 .exchanges()
@@ -148,7 +173,18 @@ impl FlowsBackend for SessionFlowsBackend {
     }
 
     fn delete<'a>(&'a self, seq: u64) -> BoxFuture<'a, bool> {
-        Box::pin(async move { self.session.remove_exchange(seq).await })
+        Box::pin(async move {
+            if self.is_deleted(seq) {
+                return false;
+            }
+            let removed = self.session.remove_exchange(seq).await;
+            if removed {
+                // Tombstone even when the session already forgot the
+                // sequence: detail/replay must keep answering 404.
+                self.mark_deleted(seq);
+            }
+            removed
+        })
     }
 
     fn replay<'a>(
@@ -156,6 +192,9 @@ impl FlowsBackend for SessionFlowsBackend {
         seq: u64,
     ) -> BoxFuture<'a, std::result::Result<serde_json::Value, String>> {
         Box::pin(async move {
+            if self.is_deleted(seq) {
+                return Err(format!("flow {seq} not found"));
+            }
             let outcome = replay_session_flow(&self.session, &self.target, seq)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -219,9 +258,11 @@ capture) or fingerprint a saved bundle for classified LLM traffic.";
 /// Sequences are **one-based** HAR entry positions (index + 1): the shared
 /// cursor protocol (`GET /__flows?after=N`, `CaptureSession::flow_summaries`)
 /// treats `after = 0` as "nothing seen yet", so a zero sequence could never
-/// be delivered. Deleting an entry shifts later entries (and therefore their
-/// sequences) down by one, mirroring plain vector deletion; attached TUIs
-/// absorb the renumbering on their next poll. Replays re-issue the recorded
+/// be delivered. Sequences remain stable forever: deletes tombstone the
+/// entry in place ([`HarStore::tombstone`]) instead of splicing the vector,
+/// so later sequences never shift and attached TUI cursors stay valid.
+/// Tombstoned sequences are omitted from listings, answer 404 on detail and
+/// replay, and never reach HAR exports. Replays re-issue the recorded
 /// request against the configured target origin (client-replay semantics:
 /// no bundle is written, the recorded response is never compared).
 pub struct HarFlowsBackend {
@@ -250,8 +291,13 @@ impl HarFlowsBackend {
 
     /// Re-issues the recorded request at `seq` against the target origin.
     async fn replay_entry(&self, seq: u64) -> std::result::Result<ProxyReplayOutcome, String> {
-        let entry = Self::index_of(seq)
-            .and_then(|index| self.har.entry(index))
+        let index = Self::index_of(seq).ok_or_else(|| format!("flow {seq} not found"))?;
+        if self.har.is_tombstoned(index) {
+            return Err(format!("flow {seq} not found"));
+        }
+        let entry = self
+            .har
+            .entry(index)
             .ok_or_else(|| format!("flow {seq} not found"))?;
         let request = &entry["request"];
         let method = request["method"].as_str().unwrap_or("GET");
@@ -311,9 +357,11 @@ impl FlowsBackend for HarFlowsBackend {
         Box::pin(async move {
             // O(new entries): only entries past the cursor leave the lock.
             // `seq > after` on one-based sequences == index >= after.
+            // Tombstoned placeholders keep their index but are not flows.
             self.har
                 .entries_from(after as usize)
                 .into_iter()
+                .filter(|(index, _)| !self.har.is_tombstoned(*index))
                 .take(limit)
                 .map(|(index, entry)| summary_from_har(index as u64 + 1, &entry))
                 .collect()
@@ -327,6 +375,9 @@ impl FlowsBackend for HarFlowsBackend {
     fn detail<'a>(&'a self, seq: u64) -> BoxFuture<'a, Option<FlowDetailDto>> {
         Box::pin(async move {
             let index = Self::index_of(seq)?;
+            if self.har.is_tombstoned(index) {
+                return None;
+            }
             detail_from_har(seq, &self.har.entry(index)?)
         })
     }
@@ -334,7 +385,7 @@ impl FlowsBackend for HarFlowsBackend {
     fn delete<'a>(&'a self, seq: u64) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             Self::index_of(seq)
-                .map(|index| self.har.remove_entry(index))
+                .map(|index| self.har.tombstone(index))
                 .unwrap_or(false)
         })
     }
@@ -778,12 +829,17 @@ mod tests {
 
     /// In-memory backend seeded directly with exchanges (test-only).
     struct SeededStore {
-        exchanges: Vec<CapturedExchange>,
+        exchanges: std::sync::Mutex<Vec<CapturedExchange>>,
     }
 
     impl SeededStore {
-        fn find(&self, seq: u64) -> Option<&CapturedExchange> {
-            self.exchanges.iter().find(|e| e.sequence == seq)
+        fn find(&self, seq: u64) -> Option<CapturedExchange> {
+            self.exchanges
+                .lock()
+                .expect("seeded store lock")
+                .iter()
+                .find(|e| e.sequence == seq)
+                .cloned()
         }
     }
 
@@ -795,6 +851,8 @@ mod tests {
         ) -> BoxFuture<'a, Vec<FlowSummaryDto>> {
             Box::pin(async move {
                 self.exchanges
+                    .lock()
+                    .expect("seeded store lock")
                     .iter()
                     .filter(|e| e.sequence > after)
                     .take(limit)
@@ -804,22 +862,30 @@ mod tests {
         }
 
         fn latest_seq<'a>(&'a self) -> BoxFuture<'a, u64> {
-            Box::pin(async move { self.exchanges.last().map(|e| e.sequence).unwrap_or(0) })
+            Box::pin(async move {
+                self.exchanges
+                    .lock()
+                    .expect("seeded store lock")
+                    .last()
+                    .map(|e| e.sequence)
+                    .unwrap_or(0)
+            })
         }
 
         fn detail<'a>(&'a self, seq: u64) -> BoxFuture<'a, Option<FlowDetailDto>> {
             Box::pin(async move {
                 self.find(seq)
+                    .as_ref()
                     .map(|e| FlowDetailDto::from_exchange(e, None, None))
             })
         }
 
         fn delete<'a>(&'a self, seq: u64) -> BoxFuture<'a, bool> {
             Box::pin(async move {
-                // The seeded store is immutable; the 204 path is exercised by
-                // the session-backed backend in embedded TUI use.
-                let _ = seq;
-                false
+                let mut exchanges = self.exchanges.lock().expect("seeded store lock");
+                let before = exchanges.len();
+                exchanges.retain(|e| e.sequence != seq);
+                before != exchanges.len()
             })
         }
 
@@ -847,7 +913,9 @@ mod tests {
     async fn spawn_app(
         exchanges: Vec<CapturedExchange>,
     ) -> (String, Arc<RwLock<dyn SavedFilterStore>>) {
-        let backend: Arc<dyn FlowsBackend> = Arc::new(SeededStore { exchanges });
+        let backend: Arc<dyn FlowsBackend> = Arc::new(SeededStore {
+            exchanges: std::sync::Mutex::new(exchanges),
+        });
         let saved: Arc<RwLock<dyn SavedFilterStore>> = Arc::new(RwLock::new(
             crate::tui::filter::InMemorySavedFilterStore::new(),
         ));
@@ -1175,7 +1243,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn proxy_mode_delete_removes_entry_and_shifts_indices() {
+    async fn proxy_mode_delete_tombstones_and_keeps_sequences_stable() {
         let target = Url::parse("http://localhost:9999").expect("target");
         let base = spawn_har_app(
             vec![
@@ -1193,20 +1261,127 @@ mod tests {
             .expect("delete");
         assert_eq!(removed.status(), StatusCode::NO_CONTENT);
 
-        // The deleted sequence is gone; the former entry 2 now answers at 1.
-        let missing = client
-            .delete(format!("{base}/__flows/2"))
-            .send()
-            .await
-            .expect("second delete");
-        let remaining = client
+        // Sequences never shift: seq 1 is gone (404 on detail and replay)
+        // while seq 2 still answers at seq 2 — the tombstoned placeholder
+        // keeps its index.
+        let missing_detail = client
             .get(format!("{base}/__flows/1"))
             .send()
             .await
-            .expect("get shifted");
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            .expect("get deleted");
+        assert_eq!(missing_detail.status(), StatusCode::NOT_FOUND);
+        let missing_replay = client
+            .post(format!("{base}/__replay/1"))
+            .send()
+            .await
+            .expect("replay deleted");
+        assert_eq!(missing_replay.status(), StatusCode::NOT_FOUND);
+
+        let remaining = client
+            .get(format!("{base}/__flows/2"))
+            .send()
+            .await
+            .expect("get survivor at its original sequence");
         let detail: Value = remaining.json().await.expect("detail json");
-        assert_eq!(detail["path"], "/two");
+        assert_eq!(detail["path"], "/two", "later sequence must not shift");
+
+        // Cursor polling stays stable: after=1 yields exactly the survivor.
+        let page: Value = client
+            .get(format!("{base}/__flows"))
+            .query(&[("after", "1")])
+            .send()
+            .await
+            .expect("poll")
+            .json()
+            .await
+            .expect("poll json");
+        assert_eq!(page["latest"], 2, "latest is stable across deletes");
+        let flows = page["flows"].as_array().expect("flows array");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0]["sequence"], 2);
+
+        // Deleting an already-tombstoned flow reports not-found.
+        let repeat = client
+            .delete(format!("{base}/__flows/1"))
+            .send()
+            .await
+            .expect("repeat delete");
+        assert_eq!(repeat.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_seq5_of10_list_omits_others_unchanged_cursor_stable() {
+        let exchanges: Vec<CapturedExchange> = (1..=10)
+            .map(|seq| exchange(seq, "GET", &format!("/{seq}"), 200))
+            .collect();
+        let (base, _) = spawn_app(exchanges).await;
+        let client = reqwest::Client::new();
+
+        // Pre-delete cursor poll from after=4 sees seq 5 first.
+        let before: Value = client
+            .get(format!("{base}/__flows"))
+            .query(&[("after", "4"), ("limit", "2")])
+            .send()
+            .await
+            .expect("pre-delete poll")
+            .json()
+            .await
+            .expect("pre-delete json");
+        assert_eq!(before["flows"][0]["sequence"], 5);
+
+        let removed = client
+            .delete(format!("{base}/__flows/5"))
+            .send()
+            .await
+            .expect("delete 5");
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+
+        // The full listing omits seq 5; every other sequence unchanged.
+        let page: Value = client
+            .get(format!("{base}/__flows"))
+            .send()
+            .await
+            .expect("list")
+            .json()
+            .await
+            .expect("list json");
+        let sequences: Vec<u64> = page["flows"]
+            .as_array()
+            .expect("flows array")
+            .iter()
+            .map(|f| f["sequence"].as_u64().expect("seq"))
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![1, 2, 3, 4, 6, 7, 8, 9, 10],
+            "deleted seq omitted, others unchanged"
+        );
+        assert_eq!(page["latest"], 10, "cursor high-water mark unchanged");
+
+        // Deleted flow answers 404 on detail…
+        let detail = client
+            .get(format!("{base}/__flows/5"))
+            .send()
+            .await
+            .expect("detail of deleted");
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+        // …and a cursor poll from after=4 is unchanged (no renumbering).
+        let after: Value = client
+            .get(format!("{base}/__flows"))
+            .query(&[("after", "4")])
+            .send()
+            .await
+            .expect("post-delete poll")
+            .json()
+            .await
+            .expect("post-delete json");
+        let polled: Vec<u64> = after["flows"]
+            .as_array()
+            .expect("flows array")
+            .iter()
+            .map(|f| f["sequence"].as_u64().expect("seq"))
+            .collect();
+        assert_eq!(polled, vec![6, 7, 8, 9, 10], "cursor polls stay stable");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1302,5 +1477,92 @@ mod tests {
             state.api_key_seen,
             "recorded non-addressing headers are re-sent"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_backend_delete_tombstones_across_summaries_detail_replay() {
+        use crate::capture::session::{start_capture_session, CaptureSessionOptions};
+
+        // Upstream serving three distinct paths.
+        let upstream = axum::Router::new()
+            .route("/one", get(|| async { "1" }))
+            .route("/two", get(|| async { "2" }))
+            .route("/three", get(|| async { "3" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream bind");
+        let addr = listener.local_addr().expect("upstream addr");
+        tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .await
+                .expect("serve upstream");
+        });
+        let target = Url::parse(&format!("http://{addr}")).expect("target");
+
+        let session = Arc::new(
+            start_capture_session(CaptureSessionOptions {
+                target: target.clone(),
+                ..CaptureSessionOptions::default()
+            })
+            .await
+            .expect("session starts"),
+        );
+        let client = reqwest::Client::new();
+        for path in ["/one", "/two", "/three"] {
+            let response = client
+                .get(format!("{}{path}", session.url()))
+                .send()
+                .await
+                .expect("proxied request");
+            assert!(response.status().is_success(), "proxied {path}");
+        }
+        session.wait_for_idle().await;
+
+        let backend = SessionFlowsBackend::new(Arc::clone(&session), target);
+        // The last exchange settles when its pump task finishes; poll the
+        // projection until the flows are visible.
+        // Sequences are one-based since the flows-API contract fix; every
+        // settled flow is visible through the `after=0` cursor now.
+        let mut summaries;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            summaries = backend.summaries_after(0, 100).await;
+            if summaries.len() == 3 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            session.wait_for_idle().await;
+        }
+        assert_eq!(summaries.len(), 3, "all three settled flows must be listed");
+        let mut sequences: Vec<u64> = summaries.iter().map(|s| s.sequence).collect();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2, 3], "one-based contiguous sequences");
+
+        // Delete the middle flow; the surviving sequences never renumber.
+        let deleted = sequences[1];
+        let survivors: Vec<u64> = sequences
+            .iter()
+            .filter(|seq| **seq != deleted)
+            .copied()
+            .collect();
+        assert!(backend.delete(deleted).await);
+        let mut remaining: Vec<u64> = backend
+            .summaries_after(0, 100)
+            .await
+            .iter()
+            .map(|s| s.sequence)
+            .collect();
+        remaining.sort_unstable();
+        assert_eq!(
+            remaining, survivors,
+            "deleted seq omitted, others keep their sequences"
+        );
+        assert!(backend.detail(deleted).await.is_none());
+        assert!(backend.detail(survivors[0]).await.is_some());
+        assert_eq!(
+            backend.replay(deleted).await.err().as_deref(),
+            Some(format!("flow {deleted} not found")).as_deref()
+        );
+        assert!(!backend.delete(deleted).await, "repeat delete reports gone");
     }
 }

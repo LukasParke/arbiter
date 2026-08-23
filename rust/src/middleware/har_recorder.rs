@@ -157,6 +157,13 @@ pub fn build_har_entry(parts: &HarEntryParts) -> Value {
 }
 
 /// Thread-safe in-memory HAR log (`HARStore` in `src/server.ts`).
+///
+/// Deletes are **tombstones**: the entry stays in place carrying a
+/// `"deleted": true` marker so every later index — and therefore every
+/// one-based flow sequence served by the flows API — remains stable forever.
+/// Tombstoned entries are skipped by [`HarStore::get_har`] (exports never
+/// contain deleted flows) and must be filtered by consumers of the indexed
+/// accessors via [`HarStore::is_tombstoned`].
 #[derive(Debug, Default)]
 pub struct HarStore {
     entries: Mutex<Vec<Value>>,
@@ -172,9 +179,15 @@ impl HarStore {
     }
 
     /// The full HAR document:
-    /// `{ log: { version: "1.2", creator: { name: "Arbiter", version }, entries } }`.
     pub fn get_har(&self) -> Value {
-        let entries = self.entries.lock().expect("har store poisoned").clone();
+        let entries: Vec<Value> = self
+            .entries
+            .lock()
+            .expect("har store poisoned")
+            .iter()
+            .filter(|entry| entry.get("deleted") != Some(&Value::Bool(true)))
+            .cloned()
+            .collect();
         json!({
             "log": {
                 "version": "1.2",
@@ -213,15 +226,29 @@ impl HarStore {
             .cloned()
     }
 
-    /// Removes the entry at `index`; true when it existed. Later entries
-    /// shift down one index, mirroring plain vector deletion.
-    pub fn remove_entry(&self, index: usize) -> bool {
+    /// Tombstones the entry at `index`: keeps the placeholder in place with
+    /// a `"deleted": true` marker instead of splicing the vector, so later
+    /// indices (flow sequences) never shift. True when the entry existed and
+    /// was not already tombstoned.
+    pub fn tombstone(&self, index: usize) -> bool {
         let mut entries = self.entries.lock().expect("har store poisoned");
-        if index >= entries.len() {
-            return false;
+        match entries.get_mut(index) {
+            Some(entry) if entry.get("deleted") != Some(&Value::Bool(true)) => {
+                entry["deleted"] = json!(true);
+                true
+            }
+            _ => false,
         }
-        entries.remove(index);
-        true
+    }
+
+    /// True when the entry at `index` was tombstoned by
+    /// [`HarStore::tombstone`].
+    pub fn is_tombstoned(&self, index: usize) -> bool {
+        self.entries
+            .lock()
+            .expect("har store poisoned")
+            .get(index)
+            .is_some_and(|entry| entry.get("deleted") == Some(&Value::Bool(true)))
     }
 }
 
@@ -236,7 +263,6 @@ pub fn har_store() -> &'static HarStore {
 mod tests {
     use super::*;
     use std::io::Write as _;
-
     fn headers(entries: &[(&str, &str)]) -> HeaderMapValues {
         let mut map = HeaderMapValues::new();
         for (name, value) in entries {
@@ -247,6 +273,53 @@ mod tests {
         map
     }
 
+    #[test]
+    fn indexed_accessors_and_tombstone_deletes() {
+        let store = HarStore::new();
+        let req = headers(&[]);
+        let resp = headers(&[]);
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
+
+        // Tail reads are index-paired and skip earlier entries.
+        let tail = store.entries_from(1);
+        assert_eq!(tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(store.entry(2).is_some());
+        assert!(store.entry(3).is_none());
+
+        // Tombstoning keeps the placeholder in place: indices — and the
+        // one-based flow sequences derived from them — never shift.
+        assert!(store.tombstone(1));
+        assert_eq!(store.entry_count(), 3);
+        assert!(store.is_tombstoned(1));
+        assert!(!store.is_tombstoned(0));
+        assert!(!store.tombstone(1), "re-tombstone reports already gone");
+        assert!(!store.tombstone(9), "out-of-range reports missing");
+        let tail = store.entries_from(0);
+        assert_eq!(
+            tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "indices stable after tombstone"
+        );
+        let tail_paths: Vec<&str> = tail[1]
+            .1
+            .get("deleted")
+            .and_then(|d| d.as_bool())
+            .map(|_| "deleted")
+            .into_iter()
+            .collect();
+        assert_eq!(tail_paths, vec!["deleted"], "placeholder keeps marker");
+
+        // Exports skip tombstoned entries entirely.
+        let har = store.get_har();
+        let exported = har["log"]["entries"].as_array().expect("entries");
+        assert_eq!(exported.len(), 2);
+        assert_eq!(
+            exported[0]["request"]["url"],
+            "http://localhost:3000/test?foo=bar"
+        );
+    }
     fn sample_parts<'a>(
         req_headers: &'a HeaderMapValues,
         resp_headers: &'a HeaderMapValues,
@@ -437,29 +510,5 @@ mod tests {
         assert_eq!(global.entry_count(), 1);
         assert!(std::ptr::eq(har_store(), global));
         global.clear();
-    }
-
-    #[test]
-    fn indexed_accessors_and_remove_entry() {
-        let store = HarStore::new();
-        let req = headers(&[]);
-        let resp = headers(&[]);
-        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
-        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
-        store.add_entry(build_har_entry(&sample_parts(&req, &resp, None)));
-
-        // Tail reads are index-paired and skip earlier entries.
-        let tail = store.entries_from(1);
-        assert_eq!(tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2]);
-        assert!(store.entry(2).is_some());
-        assert!(store.entry(3).is_none());
-
-        // Removal reports existence and shifts later indices down.
-        assert!(store.remove_entry(1));
-        assert_eq!(store.entry_count(), 2);
-        assert!(store.entry(1).is_some(), "former index 2 shifted down");
-        assert!(store.entry(2).is_none());
-        let tail = store.entries_from(0);
-        assert_eq!(tail.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1]);
     }
 }

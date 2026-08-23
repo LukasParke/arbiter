@@ -42,6 +42,56 @@ impl OutputFormat {
 }
 
 // ---------------------------------------------------------------------------
+// Versioned report schemas
+// ---------------------------------------------------------------------------
+
+/// `"schema"` discriminator values stamped onto every emitted report object
+/// (first key in insertion order; `stable_stringify` sorts keys, so machine
+/// consumers must read the key, not its position).
+pub const SCHEMA_REPLAY_REPORT: &str = "arbiter.replay-report/v1";
+/// See [`SCHEMA_REPLAY_REPORT`].
+pub const SCHEMA_VIOLATIONS: &str = "arbiter.violations/v1";
+/// See [`SCHEMA_REPLAY_REPORT`].
+pub const SCHEMA_FINGERPRINT: &str = "arbiter.fingerprint/v1";
+
+/// Stamp `"schema": <name>` as the first key of a serializable report object.
+///
+/// Additive by design: constructors of the underlying report types are
+/// untouched; only the emit/report-write paths wrap through here. Non-object
+/// payloads pass through unchanged (nothing to discriminate).
+pub fn stamped<T: Serialize>(schema: &'static str, value: &T) -> Value {
+    match serde_json::to_value(value) {
+        Ok(Value::Object(map)) => {
+            let mut out = serde_json::Map::with_capacity(map.len() + 1);
+            out.insert("schema".to_string(), Value::String(schema.to_string()));
+            out.extend(map);
+            Value::Object(out)
+        }
+        Ok(other) => other,
+        Err(e) => {
+            eprintln!("warning: result is not representable as JSON ({e}); printing null");
+            Value::Null
+        }
+    }
+}
+
+/// Schema-stamped serializable *view*: `"schema"` is the literal first field
+/// in struct-style serializers (`serde_json::to_string_pretty`), so written
+/// report artifacts open with the discriminator. (`stamped` returns a
+/// `Value`, which key-sorting writers reorder — machine readers there must
+/// look the key up instead of relying on position.)
+#[derive(serde::Serialize)]
+struct StampedView<'a, T: Serialize> {
+    schema: &'static str,
+    #[serde(flatten)]
+    inner: &'a T,
+}
+
+/// Build an ordered, schema-stamped view of `inner` for file writes.
+pub fn stamped_view<'a, T: Serialize>(schema: &'static str, inner: &'a T) -> impl Serialize + 'a {
+    StampedView { schema, inner }
+}
+// ---------------------------------------------------------------------------
 // emit
 // ---------------------------------------------------------------------------
 

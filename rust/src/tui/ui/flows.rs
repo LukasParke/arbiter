@@ -59,22 +59,86 @@ fn tokens_cell(summary: &FlowSummaryDto) -> String {
         .unwrap_or_default()
 }
 
-/// Renders the full flow-list screen (table + filter bar + status bar).
+/// Renders the full flow-list screen (endpoint strip + disconnect banner +
+/// table + filter bar + status bar).
 pub(crate) fn draw_flows(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let error_lines = usize::from(app.compiled.error().is_some());
     let editing = usize::from(app.filter_editing);
     let bar_height = (1 + editing + error_lines) as u16;
+    // T4: full-width red banner while the attached instance is unreachable.
+    let banner_height = u16::from(app.disconnected_since.is_some());
+    // T3: one-line endpoint strip always visible in embedded mode.
+    let strip_height = u16::from(app.embedded.is_some());
+    let [banner_area, strip_area, main_area] = ratatui::layout::Layout::vertical([
+        Constraint::Length(banner_height),
+        Constraint::Length(strip_height),
+        Constraint::Min(3),
+    ])
+    .areas(area);
+
+    if let Some(since) = app.disconnected_since.as_deref() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ATTACHED INSTANCE UNREACHABLE — data stale since {since} "),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            banner_area,
+        );
+    }
+    // Clone the label up front: `app` is borrowed mutably by the table
+    // draw below.
+    let endpoint_label = app.embedded.as_ref().map(endpoint_line);
+    if let Some(label) = &endpoint_label {
+        // First paint (no flows yet): a large centered call to action.
+        if app.flows.is_empty() && !app.filter_editing {
+            let [_, center, _] = ratatui::layout::Layout::vertical([
+                Constraint::Percentage(40),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .areas(main_area);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                center,
+            );
+        }
+        // Persistent one-line header strip.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {label} "),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))),
+            strip_area,
+        );
+    }
+
     let [table_area, bar_area, status_area] = ratatui::layout::Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(bar_height),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(main_area);
 
     draw_table(f, table_area, app);
     draw_filter_bar(f, bar_area, app);
     draw_status_bar(f, status_area, app);
+}
+
+/// `proxy listening → send traffic to <url>  (target <target>)`.
+fn endpoint_line(endpoint: &crate::tui::app::EmbeddedEndpoint) -> String {
+    format!(
+        "proxy listening → send traffic to {}  (target {})",
+        endpoint.listen_url, endpoint.target
+    )
 }
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
@@ -209,4 +273,80 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::App;
+    use crate::tui::filter::{InMemorySavedFilterStore, SavedFilterStore};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    fn app() -> App {
+        let store: Arc<StdMutex<dyn SavedFilterStore>> =
+            Arc::new(StdMutex::new(InMemorySavedFilterStore::new()));
+        App::new(None, store)
+    }
+    /// Renders the flow-list screen into an offscreen buffer and returns
+    /// the flattened cell text.
+    fn rendered(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(110, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw_flows(f, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn embedded_header_strip_and_skeleton_advertise_endpoint() {
+        let mut app = app();
+        app.set_embedded("http://127.0.0.1:9090", "http://api.test:8080");
+        // First paint with no flows: the skeleton call to action.
+        let skeleton = rendered(&mut app);
+        assert!(skeleton.contains("proxy listening"), "{skeleton}");
+        assert!(skeleton.contains("http://127.0.0.1:9090"));
+        assert!(skeleton.contains("(target http://api.test:8080)"));
+
+        // With traffic present the strip persists at the top.
+        app.on_batch(vec![crate::tui::feed::FlowSummaryDto {
+            sequence: 1,
+            started_at: "2026-08-22T00:00:00.000Z".to_string(),
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            host: None,
+            status: Some(200),
+            duration_ms: Some(1.0),
+            kind: "http".to_string(),
+            llm: None,
+        }]);
+        let frame = rendered(&mut app);
+        assert!(frame.contains("send traffic to http://127.0.0.1:9090"));
+    }
+
+    #[test]
+    fn attach_mode_shows_no_endpoint_strip() {
+        let mut app = app();
+        let frame = rendered(&mut app);
+        assert!(!frame.contains("proxy listening"));
+    }
+
+    #[test]
+    fn disconnect_banner_renders_full_width_with_stale_stamp() {
+        let mut app = app();
+        app.set_disconnected_since(Some("12:34:56".to_string()));
+        let frame = rendered(&mut app);
+        assert!(frame.contains("ATTACHED INSTANCE UNREACHABLE"));
+        assert!(frame.contains("data stale since 12:34:56"));
+    }
+
+    #[test]
+    fn connected_feed_renders_no_banner() {
+        let mut app = app();
+        let frame = rendered(&mut app);
+        assert!(!frame.contains("UNREACHABLE"));
+    }
 }

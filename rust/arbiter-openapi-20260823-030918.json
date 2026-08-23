@@ -1,0 +1,104 @@
+{
+  "components": {
+    "schemas": {},
+    "securitySchemes": {
+      "http_": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Automatically generated API documentation from proxy traffic",
+    "title": "API Documentation",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/ping": {
+      "get": {
+        "parameters": [
+          {
+            "in": "header",
+            "name": "accept",
+            "schema": {
+              "example": "*/*",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "schema": {
+              "example": "__redacted__",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "host",
+            "schema": {
+              "example": "127.0.0.1:42183",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "example": {
+                    "pong": true
+                  },
+                  "properties": {
+                    "pong": {
+                      "example": true,
+                      "type": "boolean"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Response for GET /ping",
+            "headers": {
+              "content-length": {
+                "description": "Response header content-length",
+                "schema": {
+                  "example": "13",
+                  "type": "string"
+                }
+              },
+              "content-type": {
+                "description": "Response header content-type",
+                "schema": {
+                  "example": "application/json",
+                  "type": "string"
+                }
+              },
+              "date": {
+                "description": "Response header date",
+                "schema": {
+                  "example": "Sun, 23 Aug 2026 03:09:18 GMT",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "http_": []
+          }
+        ],
+        "summary": "GET /ping"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000"
+    }
+  ]
+}

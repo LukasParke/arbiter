@@ -290,18 +290,48 @@ impl FeedStatus {
     }
 }
 
+/// Consecutive poll failures before [`HttpFlowFeed`] reports the attached
+/// instance as unreachable.
+const DISCONNECT_AFTER_FAILURES: u32 = 2;
+
 /// HTTP polling transport against a running instance's flows API
-/// (`GET /__flows?after=N&limit=500`). Transparent to reconnects: failures
-/// keep the cursor and retry on the next poll tick.
+/// (`GET /__flows?after=N&limit=500`). Failures are tolerated transparently,
+/// but two consecutive poll failures flip the feed into a `Disconnected`
+/// state (see [`FlowFeedExt::disconnected_since`]) so the UI can banner the
+/// staleness. Polling continues automatically; the first successful poll
+/// clears the state and resets the cursor to 0 so the full snapshot is
+/// refetched (callers dedupe by sequence).
 pub struct HttpFlowFeed {
     base: Url,
     client: reqwest::Client,
     cursor: u64,
     status: FeedStatus,
+    consecutive_failures: u32,
+    /// Wall-clock `HH:MM:SS` when the current disconnection began.
+    disconnected_since: Option<String>,
+    poll_interval: Duration,
 }
 
 impl HttpFlowFeed {
     pub fn new(base: Url) -> Self {
+        Self::with_poll_interval(base, DEFAULT_POLL_INTERVAL)
+    }
+
+    /// Registers a failed poll: after [`DISCONNECT_AFTER_FAILURES`]
+    /// consecutive failures the feed reports disconnected and resets its
+    /// cursor so the first successful poll refetches everything.
+    async fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= DISCONNECT_AFTER_FAILURES {
+            if self.disconnected_since.is_none() {
+                self.disconnected_since = Some(now_hhmmss());
+            }
+            self.cursor = 0;
+        }
+    }
+
+    /// Overrides the tick interval (tests use fast polls).
+    pub fn with_poll_interval(base: Url, poll_interval: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -311,6 +341,9 @@ impl HttpFlowFeed {
             client,
             cursor: 0,
             status: FeedStatus::default(),
+            consecutive_failures: 0,
+            disconnected_since: None,
+            poll_interval,
         }
     }
 
@@ -345,6 +378,10 @@ impl HttpFlowFeed {
     }
 }
 
+/// `HH:MM:SS` stamp used by the disconnect banner.
+fn now_hhmmss() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
 /// Transport-agnostic feed operations used by the TUI event loop. Native
 /// async-fn-in-trait: the app always holds a concrete [`FlowFeed`], so no
 /// dyn dispatch is required.
@@ -364,6 +401,12 @@ pub trait FlowFeedExt {
     }
     /// Latest status line for display (transport errors, action outcomes).
     fn status_line(&self) -> Option<String>;
+    /// Wall-clock time (`HH:MM:SS`) the attached instance became
+    /// unreachable: set after two consecutive failed polls, cleared on the
+    /// first success. `None` while healthy.
+    fn disconnected_since(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -371,7 +414,6 @@ pub enum FlowFeedKind {
     Embedded,
     Http,
 }
-
 pub enum FlowFeed {
     Embedded(EmbeddedFlowFeed),
     Http(HttpFlowFeed),
@@ -426,6 +468,13 @@ impl FlowFeedExt for FlowFeed {
         match self {
             FlowFeed::Embedded(feed) => feed.status_line(),
             FlowFeed::Http(feed) => feed.status_line(),
+        }
+    }
+
+    fn disconnected_since(&self) -> Option<String> {
+        match self {
+            FlowFeed::Embedded(feed) => feed.disconnected_since(),
+            FlowFeed::Http(feed) => feed.disconnected_since(),
         }
     }
 }
@@ -618,7 +667,6 @@ impl HttpFlowFeed {
         Ok(count)
     }
 }
-
 impl FlowFeedExt for HttpFlowFeed {
     async fn next_batch(&mut self) -> Vec<FlowSummaryDto> {
         let mut url = self
@@ -635,6 +683,11 @@ impl FlowFeedExt for HttpFlowFeed {
         }
         match self.fetch_json::<FlowsPage>(url).await {
             Some(page) => {
+                // Clear any disconnect state before advancing the cursor:
+                // record_failure reset it to 0, so this poll refetched the
+                // full snapshot and callers dedupe by sequence.
+                let _recovered = self.disconnected_since.take().is_some();
+                self.consecutive_failures = 0;
                 if let Some(last) = page.flows.last() {
                     self.cursor = last.sequence.max(self.cursor);
                 } else {
@@ -642,7 +695,10 @@ impl FlowFeedExt for HttpFlowFeed {
                 }
                 page.flows
             }
-            None => Vec::new(),
+            None => {
+                self.record_failure().await;
+                Vec::new()
+            }
         }
     }
 
@@ -661,7 +717,136 @@ impl FlowFeedExt for HttpFlowFeed {
             .await;
     }
 
+    fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+
     fn status_line(&self) -> Option<String> {
         self.status.get()
+    }
+
+    fn disconnected_since(&self) -> Option<String> {
+        self.disconnected_since.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flows_page_router() -> axum::Router {
+        axum::Router::new().route(
+            "/__flows",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "latest": 2,
+                    "flows": [
+                        {
+                            "sequence": 1, "startedAt": "2026-08-22T00:00:00.000Z",
+                            "method": "GET", "path": "/one", "kind": "http"
+                        },
+                        {
+                            "sequence": 2, "startedAt": "2026-08-22T00:00:01.000Z",
+                            "method": "GET", "path": "/two", "kind": "http"
+                        }
+                    ]
+                }))
+            }),
+        )
+    }
+
+    /// Binds a listener with SO_REUSEADDR so the test can kill and revive
+    /// the server on the same address.
+    fn bind_reusable(addr: std::net::SocketAddr) -> tokio::net::TcpListener {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_reuseaddr(true).expect("reuseaddr");
+        socket.bind(addr).expect("bind");
+        let listener = socket.listen(1024).expect("listen");
+        listener.local_addr().expect("local addr");
+        listener
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_failed_polls_disconnect_then_success_refetches_all() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let listener = bind_reusable(addr);
+        let addr = listener.local_addr().expect("local addr");
+        let router = flows_page_router();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve flows page");
+        });
+        let base = Url::parse(&format!("http://{addr}")).expect("base");
+        let mut feed = HttpFlowFeed::with_poll_interval(base, Duration::from_millis(10));
+
+        // Healthy: first poll delivers the full page and advances the cursor
+        // past both sequences.
+        assert!(feed.disconnected_since().is_none());
+        let batch = feed.next_batch().await;
+        assert_eq!(
+            batch.iter().map(|f| f.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Kill the server mid-test and poll until the transport actually
+        // starts failing (an already-accepted connection can serve one last
+        // request). A single failure is tolerated without flagging
+        // disconnection.
+        server.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while feed.consecutive_failures == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "poll never failed after server death"
+            );
+            feed.next_batch().await;
+        }
+        assert!(
+            feed.disconnected_since().is_none(),
+            "one failure must not banner the instance dead"
+        );
+
+        // Second consecutive failure flips to Disconnected{since}.
+        while feed.consecutive_failures < DISCONNECT_AFTER_FAILURES {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "polls never reached the disconnect threshold"
+            );
+            feed.next_batch().await;
+        }
+        let since = feed
+            .disconnected_since()
+            .expect("disconnected after 2 failures");
+        assert_eq!(since.len(), 8, "HH:MM:SS stamp");
+
+        // Keep failing while down: the stamp must not move.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        feed.next_batch().await;
+        assert_eq!(feed.disconnected_since().as_deref(), Some(since.as_str()));
+
+        // Revive on the same port: success clears the banner and resets the
+        // cursor to 0 so the previously-consumed sequences are refetched
+        // (the app dedupes them by sequence).
+        let listener = bind_reusable(addr);
+        assert_eq!(listener.local_addr().expect("addr"), addr);
+        let router = flows_page_router();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve revived");
+        });
+        let mut recovered = Vec::new();
+        for _ in 0..50 {
+            recovered = feed.next_batch().await;
+            if !recovered.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            recovered.iter().map(|f| f.sequence).collect::<Vec<_>>(),
+            vec![1, 2],
+            "full refetch includes already-seen sequences"
+        );
+        assert!(feed.disconnected_since().is_none(), "banner cleared");
     }
 }

@@ -8,15 +8,17 @@ use clap::Args;
 use crate::error::Result;
 use crate::mock::{options_from_parts, run_mock, MatchStrategy, MockOptions};
 
+/// Help EXAMPLES block (G3): every `arbiter mock ...` line here must parse
+/// verbatim — asserted by `every_example_line_parses` below.
+const EXAMPLES: &str = "EXAMPLES:\n  arbiter mock --spec openapi.yaml --port 4010 --watch\n      Generate example responses; reload on spec edits.\n\n  arbiter mock --capture .arbiter/bundle --match-strategy strongest\n      Replay a capture bundle byte-exact, best-match selection.\n\n  arbiter mock --spec api.yaml --fault-latency-ms 250 --fault-status 503 --fault-fraction 20\n      20% of requests get 250ms latency then a 503.\n\n  arbiter mock --capture DIR --var env=test --fault-error reset\n      Pin {{vars.env}} in templated bodies and reset connections.";
+
 /// Simulate an API from an OpenAPI spec or a captured bundle.
 ///
 /// Spec mode generates Prism-style example responses (examples >
 /// schema-derived sample > empty 200). Capture mode replays recorded
 /// exchanges byte-exact. Faults apply to both modes.
 #[derive(Args, Debug)]
-#[command(
-    after_help = "EXAMPLES:\n  arbiter mock --spec openapi.yaml --port 4010 --watch\n      Generate example responses; reload on spec edits.\n\n  arbiter mock --capture .arbiter/bundle --match strongest\n      Replay a capture bundle byte-exact, best-match selection.\n\n  arbiter mock --spec api.yaml --fault-latency-ms 250 --fault-status 503 --fault-fraction 20\n      20% of requests get 250ms latency then a 503.\n\n  arbiter mock --capture DIR --var env=test --fault-error reset\n      Pin {{vars.env}} in templated bodies and reset connections."
-)]
+#[command(after_help = EXAMPLES)]
 pub struct MockCommand {
     /// OpenAPI spec (yaml|yml|json) to generate example responses from.
     /// Mutually exclusive with --capture.
@@ -108,5 +110,37 @@ impl MockCommand {
     /// Run the mock server until Ctrl-C. Exported for cli-dx assembly.
     pub async fn run(&self) -> Result<()> {
         run_mock(self.to_options()?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G3 regression: every `arbiter mock ...` line in the EXAMPLES block
+    /// must parse verbatim — copy-pasting our own help can never fail.
+    #[test]
+    fn every_example_line_parses() {
+        let lines: Vec<&str> = EXAMPLES
+            .lines()
+            .filter(|l| l.starts_with("  arbiter "))
+            .collect();
+        assert!(
+            lines.len() >= 4,
+            "EXAMPLES block lost its command lines: {lines:?}"
+        );
+        for line in lines {
+            let tokens: Vec<&str> = line.split_whitespace().skip(1).collect();
+            MockCommand::augment_args(clap::Command::new("mock"))
+                .try_get_matches_from(tokens.iter().copied())
+                .unwrap_or_else(|e| panic!("example does not parse ({e}): {line}"));
+        }
+    }
+
+    /// G3 regression: the fixed example uses the real flag name.
+    #[test]
+    fn examples_reference_real_match_flag() {
+        assert!(!EXAMPLES.contains("--match "), "ghost --match flag back");
+        assert!(EXAMPLES.contains("--match-strategy strongest"));
     }
 }

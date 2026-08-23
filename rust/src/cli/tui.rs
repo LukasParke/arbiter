@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event as CtEvent, KeyEvent, KeyEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -21,9 +21,9 @@ use url::Url;
 
 use crate::capture::session::{start_capture_session, CaptureSessionOptions};
 use crate::error::Result;
-use crate::tui::app::{map_key, App, Effect, Screen};
+use crate::tui::app::{App, Effect, Screen};
 use crate::tui::feed::{EmbeddedFlowFeed, FlowFeed, FlowFeedExt, HttpFlowFeed};
-use crate::tui::filter::{InMemorySavedFilterStore, SavedFilterStore};
+use crate::tui::filter::SavedFilterStore;
 use crate::types::CaptureMode;
 
 const DEFAULT_TARGET: &str = "http://127.0.0.1:8080";
@@ -73,9 +73,12 @@ pub fn run(args: &TuiCommand) -> i32 {
 
 async fn run_async(args: &TuiCommand) -> Result<()> {
     let saved_filters: Arc<Mutex<dyn SavedFilterStore>> =
-        Arc::new(Mutex::new(InMemorySavedFilterStore::new()));
-    let app = App::new(args.filter.as_deref(), saved_filters);
+        Arc::new(Mutex::new(crate::tui::filter::FileSavedFilterStore::new(
+            crate::tui::filter::FileSavedFilterStore::default_path(),
+        )));
+    let mut app = App::new(args.filter.as_deref(), saved_filters);
 
+    let mut embedded_listen_url: Option<String> = None;
     let feed = if let Some(base) = args.attach.clone() {
         probe_attach(&base).await?;
         FlowFeed::Http(HttpFlowFeed::new(base))
@@ -95,10 +98,21 @@ async fn run_async(args: &TuiCommand) -> Result<()> {
             ..CaptureSessionOptions::default()
         };
         let session = start_capture_session(options).await?;
+        embedded_listen_url = Some(session.url().to_string());
         let tick = session.subscribe_flows();
         // Replays go against the configured target, not the listen address.
         FlowFeed::Embedded(EmbeddedFlowFeed::new(Arc::new(session), target, tick))
     };
+
+    // T3: advertise where to send traffic from first paint onward.
+    if let crate::tui::feed::FlowFeed::Embedded(_) = &feed {
+        if let Some(url) = embedded_listen_url.as_ref() {
+            app.set_embedded(
+                url.clone(),
+                args.target.as_ref().map(Url::to_string).unwrap_or_default(),
+            );
+        }
+    }
 
     run_app(app, feed).await
 }
@@ -172,16 +186,17 @@ const RENDER_TICK: Duration = Duration::from_millis(100);
 async fn run_app(mut app: App, mut feed: FlowFeed) -> Result<()> {
     // Key events come from a dedicated blocking thread so the async loop
     // never blocks on crossterm's poll (perf bar).
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
     std::thread::spawn(move || loop {
         match crossterm::event::poll(RENDER_TICK) {
             Ok(true) => match crossterm::event::read() {
-                Ok(CtEvent::Key(KeyEvent {
-                    code,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                })) => {
-                    if key_tx.send(code).is_err() {
+                Ok(CtEvent::Key(
+                    event @ KeyEvent {
+                        kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                        ..
+                    },
+                )) => {
+                    if key_tx.send(event).is_err() {
                         return;
                     }
                 }
@@ -205,16 +220,18 @@ async fn run_app(mut app: App, mut feed: FlowFeed) -> Result<()> {
 
     loop {
         tokio::select! {
-            maybe_code = key_rx.recv() => {
-                let Some(code) = maybe_code else { break };
+            maybe_event = key_rx.recv() => {
+                let Some(event) = maybe_event else { break };
                 let editing = matches!(app.screen, Screen::Palette) || app.filter_editing;
-                for action in map_key(code, app.screen, editing) {
+                for action in crate::tui::app::map_key_event(event.code, event.modifiers, app.screen, editing) {
                     for effect in app.handle_action(action) {
                         execute_effect(&mut app, &feed, effect).await;
                     }
                 }
             }
             _ = feed_tick.tick() => {
+                // T4: surface attached-instance reachability.
+                app.set_disconnected_since(feed.disconnected_since());
                 if !app.filter_editing && app.screen != Screen::Palette {
                     let batch = feed.next_batch().await;
                     if !batch.is_empty() {

@@ -1,0 +1,64 @@
+{
+  "log": {
+    "creator": {
+      "name": "Arbiter",
+      "version": "1.0.0"
+    },
+    "entries": [
+      {
+        "request": {
+          "headers": [
+            {
+              "name": "accept",
+              "value": "*/*"
+            },
+            {
+              "name": "authorization",
+              "value": "__redacted__"
+            },
+            {
+              "name": "host",
+              "value": "127.0.0.1:42957"
+            }
+          ],
+          "httpVersion": "HTTP/1.1",
+          "method": "GET",
+          "queryString": [
+            {
+              "name": "since",
+              "value": "today"
+            }
+          ],
+          "url": "http://127.0.0.1:44429/ping?since=today"
+        },
+        "response": {
+          "content": {
+            "mimeType": "application/json",
+            "size": 13,
+            "text": "{\"pong\":true}"
+          },
+          "headers": [
+            {
+              "name": "content-length",
+              "value": "13"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            },
+            {
+              "name": "date",
+              "value": "Sun, 23 Aug 2026 03:11:44 GMT"
+            }
+          ],
+          "httpVersion": "HTTP/1.1",
+          "status": 200,
+          "statusText": "OK"
+        },
+        "startedDateTime": "2026-08-23T03:11:44.421Z",
+        "time": 0
+      }
+    ],
+    "version": "1.2"
+  }
+}

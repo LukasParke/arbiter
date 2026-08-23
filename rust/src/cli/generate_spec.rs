@@ -26,9 +26,14 @@ pub struct GenerateSpecArgs {
     #[arg(long = "title", default_value = "Generated API Specification")]
     pub title: String,
 
-    /// API version in generated spec
-    #[arg(long = "version", default_value = "1.0.0")]
-    pub version: String,
+    /// API version written into the generated spec's info block
+    /// (renamed from `--version`, which is the binary's own -V concern)
+    #[arg(
+        long = "api-version",
+        default_value = "1.0.0",
+        value_name = "API_VERSION"
+    )]
+    pub api_version: String,
 
     /// server URL for generated spec
     #[arg(long = "server-url")]
@@ -43,7 +48,7 @@ pub fn run(args: &GenerateSpecArgs) -> i32 {
 
     println!("Generating OpenAPI spec from {}", args.input);
 
-    let spec = match generate_spec_from_traffic(input, &args.title, &args.version) {
+    let spec = match generate_spec_from_traffic(input, &args.title, &args.api_version) {
         Ok(spec) => spec,
         Err(e) => fail(format!("Spec generation failed: {e}")),
     };
@@ -113,7 +118,7 @@ mod tests {
             output: output.map(|p| p.to_string_lossy().into_owned()),
             json,
             title: "Generated API Specification".to_string(),
-            version: "1.0.0".to_string(),
+            api_version: "1.0.0".to_string(),
             server_url: None,
         }
     }

@@ -739,8 +739,7 @@ pub struct SavedFilter {
 }
 
 /// Storage seam for named filters; the TUI palette and `GET/PUT
-/// /__saved-filters` both go through this. cli-dx wires a file-backed
-/// instance via [`InMemorySavedFilterStore::with_file`].
+/// /__saved-filters` both go through this.
 pub trait SavedFilterStore: Send + Sync {
     fn list(&self) -> Vec<SavedFilter>;
     /// Inserts or updates by name.
@@ -748,6 +747,29 @@ pub trait SavedFilterStore: Send + Sync {
     /// Removes by name; true when it existed.
     fn remove(&mut self, name: &str) -> bool;
 }
+
+/// User-facing filter grammar reference rendered inside the `?` help
+/// overlay so every predicate is documented outside the source (T5).
+pub const FILTER_HELP: &str = "\
+FILTERS — grammar reference
+  predicates
+    method=GET            exact method (e.g. method=POST)
+    status=2xx            response class (1xx–5xx); exact code: status=404
+    status>=500           numeric comparison: > >= < <= = !=
+    host=api.example.com  Host header value
+    path~/v1/**           glob over the request path (** crosses segments)
+    provider=anthropic    LLM metadata key (capture-session flows only)
+    model~claude          substring match with ~
+    body~\"rate limit\"   substring of resolved request/response bodies
+  free text               a bare word matches method, path, or host
+                          (case-insensitive substring)
+  combining               adjacent terms AND together, OR alternates, and
+                          parentheses group: (method=POST OR status=2xx) path~/v1/**
+  quoting                 wrap values containing spaces or parentheses in
+                          double quotes
+  saved filters           :save NAME stores the active expression,
+                          :load NAME re-applies it, :filters lists names;
+                          saved filters persist to disk across runs";
 
 /// In-memory saved-filter set with an optional JSON file backing store.
 #[derive(Default)]
@@ -815,6 +837,169 @@ impl SavedFilterStore for InMemorySavedFilterStore {
             self.persist();
         }
         removed
+    }
+}
+
+/// File-backed saved-filter store (T2): loads the JSON set on
+/// construction, writes atomically (temp file + rename) with `0600`
+/// permissions on every mutation, and creates missing parent directories.
+/// The default location is `$XDG_CONFIG_HOME/arbiter/filters.json` or
+/// `~/.config/arbiter/filters.json`; CLI wiring may override it with the
+/// config `[tui]` section's path.
+pub struct FileSavedFilterStore {
+    filters: Vec<SavedFilter>,
+    path: PathBuf,
+}
+
+impl FileSavedFilterStore {
+    /// Loads the store from `path`. A missing or unreadable file yields an
+    /// empty store (first run); a malformed file never blocks startup.
+    pub fn new(path: PathBuf) -> Self {
+        let filters = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<SavedFilter>>(&bytes).ok())
+            .unwrap_or_default();
+        Self { filters, path }
+    }
+
+    /// Default persistence path: `$XDG_CONFIG_HOME/arbiter/filters.json`,
+    /// falling back to `~/.config/arbiter/filters.json`.
+    pub fn default_path() -> PathBuf {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(xdg).join("arbiter").join("filters.json");
+        }
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home)
+                .join(".config")
+                .join("arbiter")
+                .join("filters.json"),
+            None => PathBuf::from("filters.json"),
+        }
+    }
+
+    /// Atomic write: create parent dirs, serialize to `<path>.tmp` with
+    /// owner-only permissions, then rename over the destination so a crash
+    /// can never leave a truncated filter file.
+    fn persist(&self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let json = serde_json::to_vec_pretty(&self.filters)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&json)?;
+        std::fs::rename(&tmp, &self.path)
+    }
+}
+
+impl SavedFilterStore for FileSavedFilterStore {
+    fn list(&self) -> Vec<SavedFilter> {
+        self.filters.clone()
+    }
+
+    fn save(&mut self, filter: SavedFilter) {
+        match self.filters.iter_mut().find(|f| f.name == filter.name) {
+            Some(existing) => existing.query = filter.query,
+            None => self.filters.push(filter),
+        }
+        self.filters.sort_by(|a, b| a.name.cmp(&b.name));
+        let _ = self.persist();
+    }
+
+    fn remove(&mut self, name: &str) -> bool {
+        let before = self.filters.len();
+        self.filters.retain(|f| f.name != name);
+        let removed = self.filters.len() != before;
+        if removed {
+            let _ = self.persist();
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod file_store_tests {
+    use super::*;
+
+    #[test]
+    fn filter_help_documents_every_predicate() {
+        assert!(!FILTER_HELP.trim().is_empty());
+        for token in [
+            "method=",
+            "status=2xx",
+            "status>=500",
+            "status=404",
+            "host=",
+            "path~",
+            "provider=",
+            "model~",
+            "body~",
+            " OR ",
+            "(",
+            "\"",
+            ":save",
+            ":load",
+            ":filters",
+        ] {
+            assert!(
+                FILTER_HELP.contains(token),
+                "help must document `{token}`:\n{FILTER_HELP}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_store_round_trips_over_tempdir_with_parent_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nested path that does not exist yet: persist creates parents.
+        let path = dir.path().join("nested").join("filters.json");
+        let mut store = FileSavedFilterStore::new(path.clone());
+        assert!(store.list().is_empty(), "missing file starts empty");
+
+        store.save(SavedFilter {
+            name: "errors".to_string(),
+            query: "status>=500".to_string(),
+        });
+        store.save(SavedFilter {
+            name: "llm".to_string(),
+            query: "provider=anthropic".to_string(),
+        });
+
+        // On-disk representation is owner-only (unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("file written")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "filter file must be 0600");
+        }
+
+        // A fresh instance loads the persisted set.
+        let reloaded = FileSavedFilterStore::new(path.clone());
+        assert_eq!(reloaded.list(), store.list());
+        assert_eq!(reloaded.list()[0].name, "errors");
+
+        // Removal persists too.
+        let mut writable = reloaded;
+        assert!(writable.remove("errors"));
+        let after = FileSavedFilterStore::new(path);
+        assert_eq!(after.list().len(), 1);
+        assert_eq!(after.list()[0].name, "llm");
     }
 }
 #[cfg(test)]

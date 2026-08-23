@@ -2,7 +2,7 @@
 //! [`CapturedExchange`]s of everything flowing through it and can export a
 //! deterministic capture bundle. Port of `src/capture/session.ts`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use std::path::PathBuf;
@@ -47,6 +47,9 @@ use crate::ws::{pump_ws, WsCaptureMeta};
 
 use super::body_sink::{BodyLimitPolicy, BodySink, DEFAULT_MAX_BODY_BYTES, MAX_SPILLED_BODY_BYTES};
 
+/// Default hard deadline for finalizing in-flight exchanges on close().
+pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 3000;
+
 pub struct CaptureSessionOptions {
     pub target: Url,
     /// Listen address; default 127.0.0.1.
@@ -64,6 +67,10 @@ pub struct CaptureSessionOptions {
     /// Auto-close after this many ms without traffic; the timer resets on
     /// every settled exchange.
     pub idle_timeout_ms: Option<u64>,
+    /// Hard deadline for in-flight exchanges on close(): exchanges still
+    /// pending afterwards are finalized as partial captures so an interrupt
+    /// can never hang shutdown or lose the session. Default 3000 ms.
+    pub shutdown_grace_ms: Option<u64>,
 }
 
 impl Default for CaptureSessionOptions {
@@ -78,6 +85,7 @@ impl Default for CaptureSessionOptions {
             validation: None,
             max_body_bytes: None,
             idle_timeout_ms: None,
+            shutdown_grace_ms: None,
         }
     }
 }
@@ -95,6 +103,39 @@ pub struct ExportOptions {
 pub struct ExportResult {
     pub manifest: CaptureManifest,
     pub output_dir: PathBuf,
+    /// Exchanges force-finalized as incomplete because the shutdown grace
+    /// expired while they were still in flight (drives the INTERRUPTED
+    /// sidecar marker and the stderr warning).
+    pub interrupted_exchanges: usize,
+}
+
+/// Registry entry for an exchange that started but has not settled. The
+/// handler updates it as phases complete, so a deadline shutdown can build
+/// a partial [`CapturedExchange`] from whatever bytes settled so far.
+struct PendingExchange {
+    seq: u64,
+    started_at_iso: String,
+    started: Instant,
+    method: String,
+    raw_path: String,
+    http_version: String,
+    request_headers: HeaderMapValues,
+    request_bytes: Vec<u8>,
+    /// Upstream response head once it arrived; None means the exchange hung
+    /// before any response byte.
+    response: Option<PendingResponseHead>,
+    /// Shared with the response pump so partial stream bytes survive a
+    /// forced finalization.
+    response_sink: Option<Arc<Mutex<Option<BodySink>>>>,
+}
+
+/// Response head captured before the body pump took over.
+struct PendingResponseHead {
+    status: u16,
+    status_text: String,
+    http_version: String,
+    headers: HeaderMapValues,
+    is_sse: bool,
 }
 
 struct SessionInner {
@@ -117,6 +158,17 @@ struct SessionInner {
     flow_seq: watch::Sender<u64>,
     client: reqwest::Client,
     inline_body_limit: u64,
+    /// Exchanges started but not yet settled, keyed by sequence.
+    pending: Mutex<HashMap<u64, PendingExchange>>,
+    /// Sequences already recorded exactly once; a late settle after a
+    /// forced finalization must not duplicate the exchange.
+    recorded: Mutex<HashSet<u64>>,
+    /// Set when the shutdown grace expired with exchanges in flight.
+    interrupted: AtomicBool,
+    /// Number of exchanges force-finalized by the shutdown deadline.
+    interrupted_count: AtomicUsize,
+    /// Hard deadline for in-flight exchanges during close().
+    shutdown_grace: Duration,
 }
 
 impl SessionInner {
@@ -162,6 +214,25 @@ impl SessionInner {
             &std::env::temp_dir(),
         )
     }
+
+    fn register_pending(&self, entry: PendingExchange) {
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .insert(entry.seq, entry);
+    }
+
+    fn update_pending_request(&self, seq: u64, request_bytes: Vec<u8>) {
+        if let Some(entry) = self.pending.lock().expect("pending lock").get_mut(&seq) {
+            entry.request_bytes = request_bytes;
+        }
+    }
+
+    fn update_pending_response(&self, seq: u64, head: PendingResponseHead) {
+        if let Some(entry) = self.pending.lock().expect("pending lock").get_mut(&seq) {
+            entry.response = Some(head);
+        }
+    }
 }
 
 struct SessionCore {
@@ -170,6 +241,10 @@ struct SessionCore {
     shutdown_tx: watch::Sender<u8>,
     server_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Set by the first shutdown path that performs the bundle export; later
+    /// paths skip re-exporting (double-shutdown race between the idle
+    /// watchdog and the CLI signal path).
+    exported: AtomicBool,
 }
 
 /// A running capture proxy. Cloneable handle onto the shared server state.
@@ -267,7 +342,7 @@ pub async fn start_capture_session(options: CaptureSessionOptions) -> Result<Cap
         output: options.output.clone(),
         validation: options.validation,
         started_at: now_iso(),
-        sequence: AtomicU64::new(0),
+        sequence: AtomicU64::new(1),
         exchanges: Mutex::new(Vec::new()),
         bodies: Mutex::new(HashMap::new()),
         failures: Mutex::new(Vec::new()),
@@ -282,11 +357,38 @@ pub async fn start_capture_session(options: CaptureSessionOptions) -> Result<Cap
             .build()
             .map_err(|e| Error::other(format!("build upstream client: {e}")))?,
         inline_body_limit: options.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
+        pending: Mutex::new(HashMap::new()),
+        recorded: Mutex::new(HashSet::new()),
+        interrupted: AtomicBool::new(false),
+        interrupted_count: AtomicUsize::new(0),
+        shutdown_grace: Duration::from_millis(
+            options
+                .shutdown_grace_ms
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
+        ),
     });
 
-    let listener = TcpListener::bind(SocketAddr::new(options.listen_host, options.listen_port))
-        .await
-        .map_err(|e| Error::io("bind capture listener", e))?;
+    // Bind, walking forward to the next free port on `AddrInUse` — but the
+    // drift is never silent (G6).
+    let mut port = options.listen_port;
+    let listener = loop {
+        match TcpListener::bind(SocketAddr::new(options.listen_host, port)).await {
+            Ok(listener) => break listener,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
+                if port == u16::MAX {
+                    return Err(Error::other("no available port for capture listener"));
+                }
+                port += 1;
+            }
+            Err(e) => return Err(Error::io("bind capture listener", e)),
+        }
+    };
+    if options.listen_port != 0 && port != options.listen_port {
+        eprintln!(
+            "warning: port {} in use, using {}",
+            options.listen_port, port
+        );
+    }
     let address = listener
         .local_addr()
         .map_err(|e| Error::io("capture listener address", e))?;
@@ -312,6 +414,7 @@ pub async fn start_capture_session(options: CaptureSessionOptions) -> Result<Cap
         shutdown_tx,
         server_task: tokio::sync::Mutex::new(Some(server_task)),
         closed: AtomicBool::new(false),
+        exported: AtomicBool::new(false),
     });
 
     if let Some(idle_ms) = options.idle_timeout_ms {
@@ -352,34 +455,156 @@ fn spawn_idle_watchdog(core: Arc<SessionCore>, idle: Duration) {
     });
 }
 
-async fn shutdown_and_export(core: &SessionCore, options: Option<ExportOptions>) -> Result<()> {
-    if core.closed.swap(true, Ordering::AcqRel) {
-        return Ok(()); // already shut down (e.g. by the idle watchdog)
+/// Shut the session down under a hard deadline and export the bundle.
+///
+/// B1 signal safety: graceful shutdown waits for open connections, so a
+/// hung upstream would otherwise hang `close()` forever and SIGKILL would
+/// lose the recording. Instead the server task is joined with the
+/// [`DEFAULT_SHUTDOWN_GRACE_MS`] deadline; exchanges still in flight after
+/// it are finalized as partial captures from whatever bytes settled, and
+/// the bundle is written whenever an output is configured — even with zero
+/// settled exchanges.
+async fn shutdown_and_export(
+    core: &SessionCore,
+    options: Option<ExportOptions>,
+) -> Result<Option<ExportResult>> {
+    // The idle watchdog, a signal handler, and the CLI close path can all try
+    // to shut the session down. Only the FIRST caller performs the graceful
+    // wait + force-finalize + export sequence; later callers get the
+    // exported result synthesized from the written manifest, so the CLI
+    // never reports a spurious "not configured" error after a watchdog
+    // export.
+    let first = !core.closed.swap(true, Ordering::AcqRel);
+    if !first {
+        let output_dir = options
+            .as_ref()
+            .map(|o| o.output.clone())
+            .or_else(|| core.inner.output.clone());
+        if let Some(dir) = output_dir {
+            let manifest_path = dir.join("manifest.json");
+            if manifest_path.exists() {
+                let bundle = crate::bundle::load_bundle(&dir)?;
+                return Ok(Some(ExportResult {
+                    manifest: bundle.manifest,
+                    output_dir: dir,
+                    interrupted_exchanges: 0,
+                }));
+            }
+        }
+        return Ok(None);
     }
     let _ = core.shutdown_tx.send(1);
-    if let Some(handle) = core.server_task.lock().await.take() {
-        let _ = handle.await;
+    let grace = core.inner.shutdown_grace;
+    if let Some(mut handle) = core.server_task.lock().await.take() {
+        if tokio::time::timeout(grace, &mut handle).await.is_err() {
+            // Connections are stuck on a hung upstream; the pending-exchange
+            // registry preserves what they captured so far.
+            handle.abort();
+        }
     }
-    core.inner.wait_for_idle().await;
-    // Exact mode exports on close when an output is configured.
-    if core.inner.mode == CaptureMode::Exact {
-        if let Some(output) = options
-            .as_ref()
-            .map(|options| options.output.clone())
-            .or_else(|| core.inner.output.clone())
-        {
-            export_core(
+    // Give settled-but-unrecorded pumps a bounded window, then salvage.
+    let deadline = Instant::now() + grace;
+    while core.inner.in_flight.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    force_finalize_pending(&core.inner);
+    let output = options
+        .as_ref()
+        .map(|options| options.output.clone())
+        .or_else(|| core.inner.output.clone());
+    match output {
+        Some(output) => {
+            if core.exported.swap(true, Ordering::AcqRel) {
+                return Ok(None);
+            }
+            let result = export_core(
                 core,
                 Some(ExportOptions {
                     output,
                     ..ExportOptions::default()
                 }),
             )
-            .await
-            .map(|_| ())?;
+            .await?;
+            Ok(Some(result))
         }
+        None => Ok(None),
     }
-    Ok(())
+}
+
+/// Finalize every still-pending exchange as a partial capture: whatever
+/// bytes settled so far are recorded with
+/// `failure { stage: "response-capture" }` and `stream.completed = false`.
+/// Returns the number of exchanges salvaged.
+fn force_finalize_pending(inner: &Arc<SessionInner>) -> usize {
+    let drained: Vec<PendingExchange> = {
+        let mut pending = inner.pending.lock().expect("pending lock");
+        pending.drain().map(|(_, entry)| entry).collect()
+    };
+    let count = drained.len();
+    for entry in drained {
+        let message = "capture interrupted before completion".to_string();
+        let (status, status_text, response_http_version, response_headers, kind) =
+            match &entry.response {
+                Some(head) => (
+                    head.status,
+                    head.status_text.clone(),
+                    head.http_version.clone(),
+                    head.headers.clone(),
+                    if head.is_sse { "sse" } else { "buffered" }.to_string(),
+                ),
+                None => (
+                    502,
+                    "Bad Gateway".to_string(),
+                    "1.1".to_string(),
+                    BTreeMap::new(),
+                    "buffered".to_string(),
+                ),
+            };
+        let response_bytes = match entry
+            .response_sink
+            .as_ref()
+            .map(|sink| sink.lock().expect("response sink lock").take())
+        {
+            Some(Some(sink)) => sink.finish().map(|done| done.bytes).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        finalize_exchange(
+            inner,
+            ExchangeOutcome {
+                seq: entry.seq,
+                started_at_iso: entry.started_at_iso,
+                duration_ms: entry.started.elapsed().as_secs_f64() * 1000.0,
+                method: entry.method,
+                raw_path: entry.raw_path,
+                http_version: entry.http_version,
+                request_headers: entry.request_headers,
+                request_bytes: entry.request_bytes,
+                status,
+                status_text,
+                response_http_version,
+                response_headers,
+                stream: StreamState {
+                    kind,
+                    completed: false,
+                    client_aborted: false,
+                    upstream_aborted: true,
+                    terminal_marker: None,
+                    error: Some(message.clone()),
+                },
+                failure: Some(CaptureFailure {
+                    stage: "response-capture".to_string(),
+                    message,
+                }),
+                response_bytes,
+                ws: None,
+            },
+        );
+    }
+    if count > 0 {
+        inner.interrupted.store(true, Ordering::Release);
+        inner.interrupted_count.store(count, Ordering::Release);
+    }
+    count
 }
 
 impl CaptureSession {
@@ -415,9 +640,26 @@ impl CaptureSession {
         export_core(&self.core, options).await
     }
 
-    /// Stops the server; exact mode exports when `output` is configured.
+    /// Stops the server under the shutdown grace and exports the bundle
+    /// when `output` is configured (even with zero settled exchanges).
     pub async fn close(self) -> Result<()> {
-        shutdown_and_export(&self.core, None).await
+        shutdown_and_export(&self.core, None).await.map(|_| ())
+    }
+
+    /// Like [`CaptureSession::close`], but returns the export result when a
+    /// bundle was written. Errors when no output is configured.
+    pub async fn close_with_export(self, options: Option<ExportOptions>) -> Result<ExportResult> {
+        match shutdown_and_export(&self.core, options).await? {
+            Some(result) => Ok(result),
+            None => Err(Error::other(
+                "No export output configured for capture session",
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    async fn pending_len(&self) -> usize {
+        self.core.inner.pending.lock().expect("pending lock").len()
     }
 
     /// Subscribes to the latest settled exchange sequence (AMEND-9). The
@@ -511,7 +753,13 @@ async fn export_core(core: &SessionCore, options: Option<ExportOptions>) -> Resu
     let exchanges = inner.exchange_snapshot();
     let failures = inner.failures_snapshot();
 
-    if inner.mode == CaptureMode::Exact && !failures.is_empty() {
+    // B1: an interrupted session exports its partial bundle instead of
+    // failing closed — the per-exchange failures carry the evidence, and a
+    // forced interrupt must never lose the whole recording.
+    if inner.mode == CaptureMode::Exact
+        && !failures.is_empty()
+        && !inner.interrupted.load(Ordering::Acquire)
+    {
         return Err(Error::other(format!(
             "Exact capture failed closed: {} capture failure(s). First: {}",
             failures.len(),
@@ -556,11 +804,19 @@ async fn export_core(core: &SessionCore, options: Option<ExportOptions>) -> Resu
             validation: (!validation.is_empty()).then_some(validation),
         },
     )?;
+    // Sidecar marker (B1): the manifest shape is frozen, so an interrupted
+    // bundle is flagged by an empty INTERRUPTED file next to the manifest.
+    let interrupted_count = inner.interrupted_count.load(Ordering::Acquire);
+    if interrupted_count > 0 {
+        let marker = options.output.join("INTERRUPTED");
+        std::fs::write(&marker, b"").map_err(|e| Error::io("write INTERRUPTED marker", e))?;
+    }
     // Round-trip verification mirrors the TS export, which returns loadBundle().
     let _bundle = load_bundle(&options.output)?;
     Ok(ExportResult {
         manifest,
         output_dir: options.output,
+        interrupted_exchanges: interrupted_count,
     })
 }
 
@@ -596,6 +852,21 @@ struct ExchangeOutcome {
 }
 
 fn finalize_exchange(inner: &Arc<SessionInner>, outcome: ExchangeOutcome) {
+    // Record each sequence at most once: a late settle after the shutdown
+    // deadline force-finalized the exchange must not duplicate it.
+    inner
+        .pending
+        .lock()
+        .expect("pending lock")
+        .remove(&outcome.seq);
+    if !inner
+        .recorded
+        .lock()
+        .expect("recorded lock")
+        .insert(outcome.seq)
+    {
+        return;
+    }
     let build = || -> Result<()> {
         let mut bodies = inner.bodies.lock().expect("bodies lock");
         let request_body = captured_body_from(
@@ -739,7 +1010,7 @@ fn upstream_failed_outcome(
 async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response {
     let started = Instant::now();
     let started_at_iso = now_iso();
-    let seq = inner.sequence.fetch_add(1, Ordering::Relaxed);
+    let seq = inner.sequence.fetch_add(1, Ordering::Relaxed); // first exchange = 1
     let method = req.method().as_str().to_string();
     let raw_path = req
         .uri()
@@ -763,6 +1034,21 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
         // body. Upstreams may still compress; that is recorded as-is.
         upstream_headers.insert("accept-encoding".to_string(), vec!["identity".to_string()]);
     }
+
+    // Register the in-flight exchange so a deadline shutdown can salvage it
+    // as a partial capture (B1).
+    inner.register_pending(PendingExchange {
+        seq,
+        started_at_iso: started_at_iso.clone(),
+        started,
+        method: method.clone(),
+        raw_path: raw_path.clone(),
+        http_version: http_version.clone(),
+        request_headers: request_headers.clone(),
+        request_bytes: Vec::new(),
+        response: None,
+        response_sink: None,
+    });
 
     // Read the request body, teeing every chunk into the sink.
     let mut request_sink = inner.new_sink();
@@ -840,6 +1126,7 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
         }
     };
     let request_bytes = request_done.bytes;
+    inner.update_pending_request(seq, request_bytes.clone());
 
     // Forward upstream. Collapse any run of leading slashes to exactly one:
     // "//x" would parse as scheme-relative in Url::join, and empty means "/".
@@ -922,6 +1209,19 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
         .as_deref()
         .map(|m| m.to_lowercase().contains("text/event-stream"))
         .unwrap_or(false);
+    // Share the response sink with the pending-exchange registry so a
+    // deadline shutdown salvages the stream bytes settled so far (B1).
+    let response_sink: Arc<Mutex<Option<BodySink>>> = Arc::new(Mutex::new(Some(inner.new_sink())));
+    inner.update_pending_response(
+        seq,
+        PendingResponseHead {
+            status,
+            status_text: status_text.clone(),
+            http_version: version_string(upstream_response.version()),
+            headers: response_headers.clone(),
+            is_sse,
+        },
+    );
     let mut sse_parser = is_sse.then(SseParser::new);
 
     let client_headers = forwardable_headers(&response_headers, false);
@@ -939,8 +1239,8 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
         .body(Body::from_stream(rx))
         .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
 
+    let pump_response_sink = Arc::clone(&response_sink);
     let pump_inner = inner.clone();
-    let mut response_sink = inner.new_sink();
     let pump_started_at_iso = started_at_iso;
     let pump_response_http_version = version_string(upstream_response.version());
     tokio::spawn(async move {
@@ -953,11 +1253,21 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
-                    if let Err(err) = response_sink.write(&chunk) {
+                    let sink_error = {
+                        let mut guard = pump_response_sink.lock().expect("response sink lock");
+                        match guard.as_mut() {
+                            Some(sink) => sink.write(&chunk).err().map(|err| {
+                                limit_message(&err)
+                                    .unwrap_or_else(|| "Response capture sink failed".to_string())
+                            }),
+                            // The shutdown deadline already took the bytes.
+                            None => Some("capture interrupted before completion".to_string()),
+                        }
+                    };
+                    if let Some(message) = sink_error {
                         response_failure = Some(CaptureFailure {
                             stage: "response-capture".to_string(),
-                            message: limit_message(&err)
-                                .unwrap_or_else(|| "Response capture sink failed".to_string()),
+                            message,
                         });
                         // Destroying the upstream (TS) truncates the stream.
                         upstream_aborted = true;
@@ -990,15 +1300,23 @@ async fn proxy(State(inner): State<Arc<SessionInner>>, req: Request) -> Response
             .as_ref()
             .and_then(|parser| parser.terminal_marker().map(str::to_string));
         let completed = !upstream_aborted && !client_gone && response_failure.is_none();
-        let response_bytes = match response_sink.finish() {
-            Ok(done) => done.bytes,
-            Err(err) => {
-                pump_inner.record_failure(CaptureFailure {
-                    stage: "persistence".to_string(),
-                    message: err.to_string(),
-                });
-                Vec::new()
-            }
+        let response_bytes = match pump_response_sink
+            .lock()
+            .expect("response sink lock")
+            .take()
+        {
+            Some(sink) => match sink.finish() {
+                Ok(done) => done.bytes,
+                Err(err) => {
+                    pump_inner.record_failure(CaptureFailure {
+                        stage: "persistence".to_string(),
+                        message: err.to_string(),
+                    });
+                    Vec::new()
+                }
+            },
+            // The shutdown deadline already salvaged these bytes.
+            None => Vec::new(),
         };
         let outcome = ExchangeOutcome {
             seq,
@@ -1060,6 +1378,20 @@ async fn proxy_ws_upgrade(
     let on_upgrade = hyper::upgrade::on(&mut req);
     drop(req.into_body()); // upgrades carry no body
 
+    // Register the in-flight upgrade so a deadline shutdown can salvage it
+    inner.register_pending(PendingExchange {
+        seq,
+        started_at_iso: started_at_iso.clone(),
+        started,
+        method: method.clone(),
+        raw_path: raw_path.clone(),
+        http_version: http_version.clone(),
+        request_headers: request_headers.clone(),
+        request_bytes: Vec::new(),
+        response: None,
+        response_sink: None,
+    });
+
     let mut upstream_headers = forwardable_headers(&request_headers, true);
     // Hop-by-hop upgrade headers were stripped for plain HTTP; restore them
     // so the upstream sees a real upgrade request.
@@ -1120,6 +1452,16 @@ async fn proxy_ws_upgrade(
         .unwrap_or("")
         .to_string();
     let response_headers = from_http_header_map(upstream_response.headers());
+    inner.update_pending_response(
+        seq,
+        PendingResponseHead {
+            status,
+            status_text: status_text.clone(),
+            http_version: "1.1".to_string(),
+            headers: response_headers.clone(),
+            is_sse: false,
+        },
+    );
 
     if status != 101 {
         // Not an upgrade: relay as a plain buffered exchange with no ws
@@ -1856,5 +2198,156 @@ mod tests {
         assert!(llm.request_shape_fp.is_some());
 
         session.close().await.unwrap();
+    }
+
+    /// Upstream route that accepts the request and never answers.
+    async fn spawn_hang_upstream() -> Url {
+        let app = Router::new().route(
+            "/hang",
+            get(|| async {
+                std::future::pending::<()>().await;
+                "unreachable"
+            }),
+        );
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind hang fixture");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Url::parse(&format!("http://{address}")).expect("fixture URL")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_finalizes_in_flight_exchange_with_marker() {
+        let target = spawn_hang_upstream().await;
+        let output = tempfile::tempdir().expect("tempdir");
+        let session = start_capture_session(CaptureSessionOptions {
+            target,
+            mode: CaptureMode::Exact,
+            output: Some(output.path().to_path_buf()),
+            shutdown_grace_ms: Some(300),
+            ..CaptureSessionOptions::default()
+        })
+        .await
+        .expect("session starts");
+
+        // Fire the request that will never settle; the proxy must record it
+        // as pending immediately.
+        let client = http_client().await;
+        let hung = tokio::spawn(client.get(format!("{}hang", session.url())).send());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while session.pending_len().await == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exchange never registered as pending"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // B1: close() must complete under the grace deadline instead of
+        // hanging on the in-flight exchange.
+        let started = std::time::Instant::now();
+        let result = session
+            .close_with_export(None)
+            .await
+            .expect("close with hung exchange");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown exceeded the grace deadline"
+        );
+        assert_eq!(result.interrupted_exchanges, 1);
+        drop(hung);
+
+        // The bundle exists and contains the partial exchange marked failed.
+        assert!(output.path().join("manifest.json").exists());
+        assert!(output.path().join("exchanges.ndjson").exists());
+        let bundle = load_bundle(output.path()).expect("bundle reloads");
+        assert_eq!(bundle.exchanges.len(), 1);
+        let exchange = &bundle.exchanges[0];
+        let failure = exchange.failure.as_ref().expect("partial is marked failed");
+        assert_eq!(failure.stage, "response-capture");
+        assert_eq!(failure.message, "capture interrupted before completion");
+        assert!(!exchange.response.stream.completed);
+        assert_eq!(exchange.request.path, "/hang");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn normal_close_exports_without_interrupt_marker() {
+        let target = spawn_upstream().await;
+        let output = tempfile::tempdir().expect("tempdir");
+        let session = start_capture_session(CaptureSessionOptions {
+            target,
+            mode: CaptureMode::Exact,
+            output: Some(output.path().to_path_buf()),
+            shutdown_grace_ms: Some(1000),
+            ..CaptureSessionOptions::default()
+        })
+        .await
+        .expect("session starts");
+
+        let client = http_client().await;
+        client
+            .post(format!("{}echo", session.url()))
+            .header("content-type", "application/json")
+            .body(json!({ "ping": true }).to_string())
+            .send()
+            .await
+            .expect("request through proxy");
+        session.wait_for_idle().await;
+
+        let result = session
+            .close_with_export(None)
+            .await
+            .expect("close exports bundle");
+        assert_eq!(result.manifest.exchange_count, 1);
+        assert_eq!(result.interrupted_exchanges, 0);
+        assert!(
+            !output.path().join("INTERRUPTED").exists(),
+            "normal path must not write the INTERRUPTED marker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_with_zero_exchanges_still_exports_bundle() {
+        let target = spawn_upstream().await;
+        let output = tempfile::tempdir().expect("tempdir");
+        let session = start_capture_session(CaptureSessionOptions {
+            target,
+            mode: CaptureMode::Exact,
+            output: Some(output.path().to_path_buf()),
+            ..CaptureSessionOptions::default()
+        })
+        .await
+        .expect("session starts");
+
+        let result = session
+            .close_with_export(None)
+            .await
+            .expect("close with no traffic");
+        assert_eq!(result.manifest.exchange_count, 0);
+        assert!(output.path().join("manifest.json").exists());
+        assert!(load_bundle(output.path()).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn port_walk_starts_on_next_free_port() {
+        let occupied = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("occupy port");
+        let requested = occupied.local_addr().expect("occupied address").port();
+        let session = start_capture_session(CaptureSessionOptions {
+            listen_port: requested,
+            ..CaptureSessionOptions::default()
+        })
+        .await
+        .expect("session walks to a free port");
+        assert_ne!(
+            session.url().port(),
+            Some(requested),
+            "G6: drifted to the next free port instead of failing"
+        );
+        session.close().await.ok();
     }
 }

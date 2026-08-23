@@ -14,9 +14,11 @@ pub struct DiffArgs {
     #[arg(short = 's', long = "spec")]
     pub spec: String,
 
-    /// path to traffic JSONL file
-    #[arg(short = 't', long = "traffic")]
-    pub traffic: String,
+    /// path to traffic JSONL file (unified input convention: --input/-i;
+    /// the pre-unification spelling `--traffic` still parses but is
+    /// deprecated and hidden from help)
+    #[arg(short = 'i', long = "input", alias = "traffic", value_name = "PATH")]
+    pub input: String,
 
     /// path to write JSON diff report
     #[arg(short = 'o', long = "output")]
@@ -28,7 +30,7 @@ pub struct DiffArgs {
 }
 
 pub fn run(args: &DiffArgs) -> i32 {
-    let result = match diff_from_traffic(Path::new(&args.spec), Path::new(&args.traffic)) {
+    let result = match diff_from_traffic(Path::new(&args.spec), Path::new(&args.input)) {
         Ok(result) => result,
         Err(e) => fail(format!("Diff failed: {e}")),
     };
