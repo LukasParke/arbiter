@@ -10,9 +10,11 @@ approved.
 
 ```bash
 cd rust
-cargo build --release          # binary: target/release/arbiter
-cargo test                     # unit + loopback integration tests
+cargo install --path .          # installs the `arbiter` binary on PATH
+cargo build --release           # or run ./target/release/arbiter directly
+cargo test                      # unit + loopback integration tests
 ```
+
 
 ## Layout
 
