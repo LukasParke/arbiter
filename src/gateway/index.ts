@@ -9,7 +9,7 @@
  */
 
 import { spawn } from 'child_process';
-import { createHash, timingSafeEqual } from 'crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import http from 'http';
 import https from 'https';
 import { once } from 'events';
@@ -49,6 +49,12 @@ export interface GatewayOptions {
   policy: GatewayPolicy;
   credentialProvider: GatewayCredentialProvider;
   listen?: { hostname?: string; port?: number };
+  /**
+   * Generate a random 16-hex correlation ID for each admitted request,
+   * replacing the caller's value before forwarding and capture. Unset by
+   * default: incoming correlation headers are forwarded unchanged.
+   */
+  requestIdHeader?: 'cf-ray' | 'x-request-id';
   /**
    * Record allowed gateway traffic through an exact CaptureSession. The
    * session sits between the gateway and the upstream, so recorded exchanges
@@ -116,6 +122,14 @@ export function validatePolicy(policy: GatewayPolicy): void {
 
 export async function startGateway(options: GatewayOptions): Promise<GatewayServer> {
   validatePolicy(options.policy);
+  const requestIdHeader = options.requestIdHeader;
+  if (
+    requestIdHeader !== undefined &&
+    requestIdHeader !== 'cf-ray' &&
+    requestIdHeader !== 'x-request-id'
+  ) {
+    throw new Error('requestIdHeader must be cf-ray or x-request-id');
+  }
   const policy = options.policy;
   const startedAt = Date.now();
   let served = 0;
@@ -253,9 +267,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
     }
 
     // 4. Obtain the real credential and build the upstream request. The
-    // client's gateway token never leaves this process.
+    // client's gateway token and other credential headers never leave this
+    // process. Only explicitly provided controller credentials may be sent.
     const requestHeaders = headersFromRaw(clientReq.rawHeaders);
-    delete requestHeaders['authorization'];
+    for (const name of Object.keys(requestHeaders)) {
+      if (captureRedaction.shouldRedactHeader(name)) {
+        delete requestHeaders[name];
+      }
+    }
     const upstreamHeaders = forwardableHeaders(requestHeaders, { stripHost: true });
     const flat: http.OutgoingHttpHeaders = {};
     for (const [name, values] of Object.entries(upstreamHeaders)) {
@@ -282,6 +301,11 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayServ
       return;
     } finally {
       credentialHeaders = null; // drop the reference immediately
+    }
+    // Nonsecret correlation metadata uses the normal forwarding/capture
+    // path, never the secret-only credential provider or a post-capture hook.
+    if (requestIdHeader !== undefined) {
+      flat[requestIdHeader] = randomBytes(8).toString('hex');
     }
     flat['host'] = upstreamUrl.host;
     flat['content-length'] = String(body.length);
