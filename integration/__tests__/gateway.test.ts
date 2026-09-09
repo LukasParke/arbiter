@@ -1,4 +1,9 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { bundleDigest, loadBundle } from '../../src/bundle/index.js';
+import { RedactionPolicy } from '../../src/capture/redaction.js';
 import http from 'http';
 import { once } from 'events';
 import { createHash } from 'crypto';
@@ -8,6 +13,7 @@ import {
   pathAllowed,
   credentialProviderFromCommand,
   type GatewayPolicy,
+  type GatewayOptions,
 } from '../../src/gateway/index.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -272,29 +278,268 @@ describe('gateway capture integration', () => {
     expect(bundle.exchanges[0].request.headers.redacted).toContain('x-api-key');
   });
 
-  it('fails closed when the credential header is not covered by capture redaction', async () => {
+  it.each(['x-upstream-cred', 'cf-ray', 'x-request-id'])(
+    'fails closed when credential header %s is not covered by capture redaction',
+    async (header) => {
+      const upstream = await startUpstream();
+      const gateway = await startGateway({
+        policy: policyFor(upstream.origin),
+        // Metadata must not be smuggled through the secret-only provider.
+        credentialProvider: () => Promise.resolve({ [header]: REAL_KEY }),
+        requestIdHeader: 'cf-ray',
+        capture: {},
+      });
+      cleanups.push(() => gateway.close());
+
+      const res = await fetch(new URL('/v1/m', gateway.url), {
+        method: 'POST',
+        headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(res.status).toBe(502);
+      expect(upstream.requests).toHaveLength(0);
+
+      // Nothing was recorded carrying the credential.
+      await gateway.capture!.waitForIdle();
+      expect(gateway.capture!.exchanges()).toHaveLength(0);
+    }
+  );
+});
+
+describe('gateway inbound credentials', () => {
+  it.each([false, true])('strips caller credentials with capture=%s', async (capture) => {
     const upstream = await startUpstream();
     const gateway = await startGateway({
       policy: policyFor(upstream.origin),
-      // 'x-upstream-cred' does not match the default redaction policy, so
-      // forwarding it through the recording path must be refused.
-      credentialProvider: () => Promise.resolve({ 'x-upstream-cred': REAL_KEY }),
-      capture: {},
+      credentialProvider: () => Promise.resolve({ 'X-Goog-Api-Key': REAL_KEY }),
+      ...(capture ? { capture: {} } : {}),
     });
     cleanups.push(() => gateway.close());
-
-    const res = await fetch(new URL('/v1/m', gateway.url), {
+    const untrusted = {
+      Authorization: `Bearer ${TOKEN}`,
+      'X-Api-Key': 'opaque-caller-key',
+      Cookie: 'opaque-caller-cookie',
+      'Set-Cookie': 'opaque-caller-set-cookie',
+      'X-Auth-Token': 'opaque-caller-token',
+      'X-Custom-Credential': 'opaque-custom-credential',
+      'X-Goog-Api-Key': 'opaque-caller-native-key',
+    };
+    const res = await fetch(new URL('/v1/messages', gateway.url), {
       method: 'POST',
-      headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      headers: { ...untrusted, 'content-type': 'application/json', 'x-benign': 'keep-me' },
       body: '{}',
     });
-    expect(res.status).toBe(502);
-    expect(upstream.requests).toHaveLength(0);
+    expect(res.status).toBe(200);
+    await res.arrayBuffer();
+    const headers = upstream.requests[0].headers;
+    expect(headers['x-goog-api-key']).toBe(REAL_KEY);
+    expect(headers['x-benign']).toBe('keep-me');
+    expect(headers['content-type']).toBe('application/json');
+    for (const [name, value] of Object.entries(untrusted)) {
+      expect(JSON.stringify(headers)).not.toContain(value);
+      if (name !== 'X-Goog-Api-Key') {
+        expect(headers).not.toHaveProperty(name.toLowerCase());
+      }
+    }
+    if (capture) {
+      await gateway.capture!.waitForIdle();
+      const exchanges = gateway.capture!.exchanges();
+      expect(exchanges).toHaveLength(1);
+      expect(exchanges[0].request.headers.values['x-benign']).toEqual(['keep-me']);
+      expect(exchanges[0].request.headers.redacted).toEqual(['x-goog-api-key']);
+      expect(JSON.stringify(exchanges)).not.toContain(REAL_KEY);
+      for (const value of Object.values(untrusted)) {
+        expect(JSON.stringify(exchanges)).not.toContain(value);
+      }
+    } else {
+      expect(gateway.capture).toBeNull();
+    }
+  });
 
-    // Nothing was recorded carrying the credential.
+  it('also strips headers identified by the configured redaction policy', async () => {
+    const upstream = await startUpstream();
+    const gateway = await startGateway({
+      policy: policyFor(upstream.origin),
+      credentialProvider: () => Promise.resolve({ 'x-upstream-cred': REAL_KEY }),
+      capture: {
+        redaction: new RedactionPolicy({ redactHeaders: ['x-opaque-*', 'x-upstream-cred'] }),
+      },
+    });
+    cleanups.push(() => gateway.close());
+    const res = await fetch(new URL('/v1/m', gateway.url), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${TOKEN}`, 'x-opaque-access': 'caller-secret' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    await res.arrayBuffer();
+    expect(upstream.requests[0].headers).not.toHaveProperty('x-opaque-access');
+    expect(upstream.requests[0].headers['x-upstream-cred']).toBe(REAL_KEY);
     await gateway.capture!.waitForIdle();
+    expect(gateway.capture!.exchanges()[0].request.headers.redacted).toEqual(['x-upstream-cred']);
+    expect(JSON.stringify(gateway.capture!.exchanges())).not.toContain('caller-secret');
     expect(JSON.stringify(gateway.capture!.exchanges())).not.toContain(REAL_KEY);
   });
+});
+
+describe('gateway request correlation', () => {
+  it('rejects unsupported options before starting either listener', async () => {
+    const listen = vi.spyOn(http.Server.prototype, 'listen');
+    try {
+      for (const value of [
+        'authorization',
+        'x-api-key',
+        'cookie',
+        'host',
+        'connection',
+        'content-length',
+        'traceparent',
+        'CF-Ray',
+        '',
+        null,
+        42,
+        {},
+        ['cf-ray'],
+      ]) {
+        await expect(
+          startGateway({
+            policy: policyFor('http://127.0.0.1:9999'),
+            credentialProvider: () => Promise.resolve({ 'x-api-key': REAL_KEY }),
+            requestIdHeader: value as GatewayOptions['requestIdHeader'],
+            capture: {},
+          }).then((gateway) => {
+            cleanups.push(() => gateway.close());
+            return gateway;
+          })
+        ).rejects.toThrow('requestIdHeader must be cf-ray or x-request-id');
+        expect(listen).not.toHaveBeenCalled();
+      }
+    } finally {
+      listen.mockRestore();
+    }
+  });
+
+  describe.each(['cf-ray', 'x-request-id'] as const)('%s', (requestIdHeader) => {
+    it.each([false, true])(
+      'generates distinct IDs before forwarding with capture=%s',
+      async (capture) => {
+        const upstream = await startUpstream();
+        const gateway = await startGateway({
+          policy: policyFor(upstream.origin),
+          credentialProvider: () => Promise.resolve({ 'x-api-key': REAL_KEY }),
+          requestIdHeader,
+          ...(capture ? { capture: {} } : {}),
+        });
+        cleanups.push(() => gateway.close());
+        const send = async (index: number) => {
+          const res = await fetch(new URL(`/v1/m/${index}`, gateway.url), {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${TOKEN}`,
+              [requestIdHeader]: 'caller-trace',
+              'x-api-key': 'opaque-caller-key',
+              'x-custom-token': 'opaque-caller-token',
+            },
+            body: '{}',
+          });
+          expect(res.status).toBe(200);
+          await res.arrayBuffer();
+        };
+        await Promise.all(Array.from({ length: 6 }, (_, i) => send(i)));
+        expect(upstream.requests).toHaveLength(6);
+        const ids = upstream.requests.map(({ headers }) => headers[requestIdHeader]);
+        expect(new Set(ids).size).toBe(6);
+        for (const { headers } of upstream.requests) {
+          expect(headers[requestIdHeader]).toMatch(/^[0-9a-f]{16}$/);
+          expect(headers['x-api-key']).toBe(REAL_KEY);
+          expect(headers).not.toHaveProperty('x-custom-token');
+        }
+        if (!capture) {
+          return;
+        }
+        await gateway.capture!.waitForIdle();
+        const exchanges = gateway.capture!.exchanges();
+        expect(exchanges).toHaveLength(6);
+        for (const exchange of exchanges) {
+          const forwarded = upstream.requests.find((req) => req.url === exchange.request.path)!;
+          expect(exchange.request.headers.values[requestIdHeader]).toEqual([
+            forwarded.headers[requestIdHeader],
+          ]);
+          expect(exchange.request.headers.redacted).toEqual(['x-api-key']);
+        }
+        const snapshot = JSON.stringify(exchanges);
+        for (const secret of [
+          TOKEN,
+          REAL_KEY,
+          'caller-trace',
+          'opaque-caller-key',
+          'opaque-caller-token',
+        ]) {
+          expect(snapshot).not.toContain(secret);
+        }
+        // Subsequent traffic cannot overwrite previously captured IDs.
+        await send(6);
+        await gateway.capture!.waitForIdle();
+        expect(JSON.stringify(exchanges)).toBe(snapshot);
+        expect(JSON.stringify(gateway.capture!.exchanges().slice(0, 6))).toBe(snapshot);
+        expect(ids).not.toContain(upstream.requests[6].headers[requestIdHeader]);
+
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arbiter-gw-correlation-'));
+        cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+        const { bundle } = await gateway.capture!.export({ output: path.join(dir, 'capture') });
+        expect(bundle.exchanges).toEqual(
+          [...gateway.capture!.exchanges()].sort((a, b) => a.sequence - b.sequence)
+        );
+        expect(bundle.manifest.bundleDigest).toBe(bundleDigest(bundle.exchanges));
+        expect(loadBundle(bundle.root).exchanges).toEqual(bundle.exchanges);
+        // Changing only correlation metadata invalidates the persisted digest.
+        const tampered = structuredClone(bundle.exchanges);
+        tampered[0].request.headers.values[requestIdHeader] = ['0000000000000000'];
+        expect(bundleDigest(tampered)).not.toBe(bundle.manifest.bundleDigest);
+        fs.writeFileSync(
+          path.join(bundle.root, 'exchanges.ndjson'),
+          tampered.map((e) => JSON.stringify(e)).join('\n') + '\n'
+        );
+        expect(() => loadBundle(bundle.root)).toThrow(/Bundle digest mismatch/);
+      }
+    );
+  });
+
+  it.each([false, true])(
+    'preserves incoming correlation and injects nothing by default with capture=%s',
+    async (capture) => {
+      const upstream = await startUpstream();
+      const gateway = await startGateway({
+        policy: policyFor(upstream.origin),
+        credentialProvider: () => Promise.resolve({ 'x-api-key': REAL_KEY }),
+        ...(capture ? { capture: {} } : {}),
+      });
+      cleanups.push(() => gateway.close());
+      for (const headers of [{ 'cf-ray': 'existing-ray', 'x-request-id': 'existing-id' }, {}]) {
+        const res = await fetch(new URL('/v1/m', gateway.url), {
+          method: 'POST',
+          headers: { authorization: `Bearer ${TOKEN}`, ...headers },
+          body: '{}',
+        });
+        expect(res.status).toBe(200);
+        await res.arrayBuffer();
+      }
+      for (const header of ['cf-ray', 'x-request-id']) {
+        expect(upstream.requests[0].headers[header]).toBe(
+          header === 'cf-ray' ? 'existing-ray' : 'existing-id'
+        );
+        expect(upstream.requests[1].headers).not.toHaveProperty(header);
+        if (capture) {
+          await gateway.capture!.waitForIdle();
+          const exchanges = gateway.capture!.exchanges();
+          expect(exchanges[0].request.headers.values[header]).toEqual([
+            upstream.requests[0].headers[header],
+          ]);
+          expect(exchanges[1].request.headers.values).not.toHaveProperty(header);
+        }
+      }
+    }
+  );
 });
 
 describe('pathAllowed', () => {

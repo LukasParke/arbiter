@@ -188,6 +188,10 @@ arbiter gateway --policy policy.json --credential-command 'op read op://vault/an
 
 The policy pins a sha256 of an opaque client token plus expiry, target origin, methods, path prefixes, optional models, and request/byte/duration ceilings. The client never sees the upstream credential; the credential command's stdout is consumed as a secret and never logged. Oversized requests receive a clean `413` JSON response.
 
+The gateway strips inbound credential-bearing headers (including authorization, API keys, cookies, and custom sensitive headers) before injecting only the headers returned by `credentialProvider`. Harmless client headers are preserved.
+
+In library use, set `requestIdHeader: 'cf-ray'` or `requestIdHeader: 'x-request-id'` to replace the caller's value with a cryptographically random 16-hex ID per admitted request. The ID is forwarded through the normal capture path and bound by the bundle digest. Other values are rejected before listening. By default, no ID is injected and incoming correlation headers are forwarded unchanged. Correlation metadata does not belong in the secret-only `credentialProvider`.
+
 With `--capture-output` (or `capture: {}` in library use), allowed gateway traffic is routed through an exact `CaptureSession` and exported as a deterministic bundle on shutdown. The gateway fails closed if the injected credential header is not covered by the capture redaction policy, so neither the gateway token nor the upstream credential can reach the bundle.
 
 ### Library usage
